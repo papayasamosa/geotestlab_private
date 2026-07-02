@@ -55,10 +55,24 @@ CONFIG = {
     "missing_threshold": 20,          # % missing above which we warn
     "outlier_std_threshold": 5,
     "ess_min_threshold": 500,         # softer threshold for ESS (was 1000)
+    # ---- Method comparison / Counterfactual Reliability traffic-light bands ----
+    # Single source of truth for the classify_* helper functions below. Durbin-Watson
+    # bands are practical interpretation bands, not formal critical-value tests — see
+    # classify_autocorrelation_risk().
+    "reliability_thresholds": {
+        "durbin_watson_low_band": (1.7, 2.3),          # 🟢 Low
+        "durbin_watson_moderate_low_band": (1.3, 1.7),  # 🟠 Moderate (positive autocorrelation side)
+        "durbin_watson_moderate_high_band": (2.3, 2.7), # 🟠 Moderate (negative autocorrelation side)
+        "overfitting_gap_pp": {"low_max": 3, "moderate_max": 8},
+        "rolling_smape_pct": {"low_max": 20, "moderate_max": 30},
+        "rolling_bias_pct": {"low_max": 5, "moderate_max": 10},
+    },
 }
 
-SMD_GOOD_THRESHOLD = 0.20
-SMD_HIGH_THRESHOLD = 0.50
+# Single source of truth for SMD thresholds: CONFIG["smd_thresholds"] is canonical;
+# these module-level names exist for readability at the (many) call sites.
+SMD_GOOD_THRESHOLD = CONFIG["smd_thresholds"]["good"]
+SMD_HIGH_THRESHOLD = CONFIG["smd_thresholds"]["high"]
 
 DATA_PATH = "data/Population Stats for Geo Tests - Master Sheet Only v2 (Standardised).xlsx"
 POPULATION_COL_RAW = "Total Population"
@@ -301,10 +315,14 @@ def classify_autocorrelation_risk(dw_stat):
         return "⚪ Insufficient data"
 
     dw = float(dw_stat)
+    _t = CONFIG["reliability_thresholds"]
+    _low_lo, _low_hi = _t["durbin_watson_low_band"]
+    _mod_lo_lo, _mod_lo_hi = _t["durbin_watson_moderate_low_band"]
+    _mod_hi_lo, _mod_hi_hi = _t["durbin_watson_moderate_high_band"]
 
-    if 1.7 <= dw <= 2.3:
+    if _low_lo <= dw <= _low_hi:
         return "🟢 Low"
-    elif (1.3 <= dw < 1.7) or (2.3 < dw <= 2.7):
+    elif (_mod_lo_lo <= dw < _mod_lo_hi) or (_mod_hi_lo < dw <= _mod_hi_hi):
         return "🟠 Moderate"
     else:
         return "🔴 High"
@@ -336,9 +354,10 @@ def classify_overfitting_risk(overfit_gap_smape):
     """
     if not _is_valid_number(overfit_gap_smape):
         return "⚪ Insufficient data"
-    if overfit_gap_smape <= 3:
+    _t = CONFIG["reliability_thresholds"]["overfitting_gap_pp"]
+    if overfit_gap_smape <= _t["low_max"]:
         return "🟢 Low"
-    if overfit_gap_smape <= 8:
+    if overfit_gap_smape <= _t["moderate_max"]:
         return "🟠 Moderate"
     return "🔴 High"
 
@@ -353,9 +372,10 @@ def classify_rolling_validation_error(rolling_smape_mean):
     """
     if not _is_valid_number(rolling_smape_mean):
         return "⚪ Insufficient data"
-    if rolling_smape_mean <= 20:
+    _t = CONFIG["reliability_thresholds"]["rolling_smape_pct"]
+    if rolling_smape_mean <= _t["low_max"]:
         return "🟢 Low"
-    if rolling_smape_mean <= 30:
+    if rolling_smape_mean <= _t["moderate_max"]:
         return "🟠 Moderate"
     return "🔴 High"
 
@@ -367,9 +387,10 @@ def classify_rolling_bias_risk(rolling_bias_pct):
     """
     if not _is_valid_number(rolling_bias_pct):
         return "⚪ Insufficient data"
-    if abs(rolling_bias_pct) <= 5:
+    _t = CONFIG["reliability_thresholds"]["rolling_bias_pct"]
+    if abs(rolling_bias_pct) <= _t["low_max"]:
         return "🟢 Low"
-    if abs(rolling_bias_pct) <= 10:
+    if abs(rolling_bias_pct) <= _t["moderate_max"]:
         return "🟠 Moderate"
     return "🔴 High"
 
@@ -784,6 +805,7 @@ def build_regularized_model(method_name, n_periods, n_splits_pref=5, fixed_alpha
     )
     return model, cv_status, False
 
+@st.cache_data(ttl=CONFIG["cache_ttl"], show_spinner=False)
 def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=None, n_splits=5, model_type="enet",
                                min_training_weeks=None):
     """
@@ -806,6 +828,12 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
     rolling_rmse_mean (float, same basis), cv_status (str describing CV vs. fallback usage across
     folds). For backwards compatibility, also accepts n_splits (ignored — all valid folds are used)
     and min_training_weeks as an alias for min_training_periods.
+
+    Cached via @st.cache_data: this is pure and deterministic (all models use a fixed
+    random_state) with no Streamlit UI calls inside, and it's the most expensive step in
+    validation (fits up to ~20 folds). It's re-invoked on every Streamlit rerun once
+    validation_triggered is set, including reruns caused by unrelated widget changes
+    elsewhere on the page, so caching avoids redundant model fitting on identical inputs.
     """
     if min_training_weeks is not None:
         min_training_periods = min_training_weeks
@@ -946,22 +974,193 @@ def classify_validation_method(fold_df, main_model_used_cv_fallback):
     else:
         return "⚪ Insufficient validation history"
 
-def placebo_analysis(uplift_list, real_uplift):
-    uplift_arr = np.array(uplift_list)
-    if len(uplift_arr) == 0:
-        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
-    median_uplift = np.median(uplift_arr)
-    p2_5, p97_5 = np.percentile(uplift_arr, [2.5, 97.5])
-    percentile_rank = np.mean(uplift_arr < real_uplift) * 100 if real_uplift is not None else np.nan
-    p_one_sided = np.mean(uplift_arr >= real_uplift) if real_uplift is not None else np.nan
-    # Two-sided: probability that absolute deviation from mean is >= observed deviation
-    if real_uplift is not None and not np.isnan(real_uplift):
-        mean_placebo = np.mean(uplift_arr)
-        p_two_sided = np.mean(np.abs(uplift_arr - mean_placebo) >= np.abs(real_uplift - mean_placebo))
+def _warn_on_row_loss(matrix_diagnostics):
+    """
+    Row-loss diagnostics: warns the user when a meaningful share of rows were dropped
+    from the model matrix because the test series or a selected control had missing KPI
+    values for some dates. Extracted from run_validation_method() so the row-loss check
+    reads as a single, named step rather than being interleaved with matrix construction.
+    """
+    pct_dropped = matrix_diagnostics.get("pct_rows_dropped", 0.0)
+    rows_dropped = matrix_diagnostics.get("rows_dropped", 0)
+    rows_before = matrix_diagnostics.get("rows_before_dropna", 0)
+    if rows_dropped > 0 and pct_dropped > 20:
+        st.error(
+            f"{rows_dropped} of {rows_before} rows ({pct_dropped:.1f}%) were removed because "
+            "the test series or at least one selected control had missing KPI values. "
+            "This is a large share of the data and the validation result may be unreliable. "
+            f"Controls with missing values: {', '.join(matrix_diagnostics.get('control_columns_with_missing', [])) or 'none'}."
+        )
+    elif rows_dropped > 0 and pct_dropped > 10:
+        st.warning(
+            f"{rows_dropped} of {rows_before} rows ({pct_dropped:.1f}%) were removed because "
+            "the test series or at least one selected control had missing KPI values. "
+            "This can affect validation reliability. "
+            f"Controls with missing values: {', '.join(matrix_diagnostics.get('control_columns_with_missing', [])) or 'none'}."
+        )
+
+def _warn_on_cv_fallback(method_name, main_model_used_cv_fallback, fold_df):
+    """
+    Surfaces a warning whenever TimeSeriesSplit cross-validation couldn't be used —
+    either for the main pre-period model (no reliability rating at all) or for some
+    rolling-origin folds (those folds are excluded from the headline validation metrics
+    and Counterfactual Reliability). See build_regularized_model() and
+    rolling_origin_validation() for why this app never falls back to regular KFold.
+    """
+    if main_model_used_cv_fallback:
+        st.warning(
+            f"⚠️ There is insufficient pre-period history to run leakage-free TimeSeriesSplit "
+            f"cross-validation for **{method_name}**. This method has not been given a "
+            "reliability rating. Add more pre-period data or reduce the validation window."
+        )
+    elif not fold_df.empty and bool(fold_df["used_cv_fallback"].any()):
+        n_fallback_folds = int(fold_df["used_cv_fallback"].sum())
+        st.warning(
+            f"⚠️ {n_fallback_folds} of {len(fold_df)} rolling-origin folds for **{method_name}** "
+            "did not have enough training history for leakage-free TimeSeriesSplit cross-validation. "
+            "Those folds were fit exploratorily with a fixed regularisation strength and are excluded "
+            "from the rolling-origin validation metrics and Counterfactual Reliability shown here."
+        )
+
+def _summarize_rolling_origin_folds(fold_df):
+    """
+    Additional rolling-origin summary stats (P90 sMAPE, mean bias, uplift-error interval)
+    computed only from TimeSeriesSplit-CV folds — exploratory fixed-alpha fallback folds
+    are excluded, since Rolling-Origin Bias (%) directly feeds Counterfactual Reliability
+    and should not be contaminated by a non-cross-validated fit.
+
+    Returns a dict with keys: rolling_smape_p90, rolling_bias_pct_mean,
+    rolling_uplift_error_pct_median, rolling_uplift_error_pct_lower,
+    rolling_uplift_error_pct_upper. All np.nan if no CV folds are available.
+    """
+    if not fold_df.empty:
+        cv_fold_df = fold_df[~fold_df["used_cv_fallback"]]
     else:
-        p_two_sided = np.nan
-    z_score = (real_uplift - np.mean(uplift_arr)) / np.std(uplift_arr) if np.std(uplift_arr) > 0 and real_uplift is not None else np.nan
-    return median_uplift, p2_5, p97_5, percentile_rank, p_one_sided, p_two_sided, z_score
+        cv_fold_df = fold_df
+
+    if cv_fold_df.empty:
+        return {
+            "rolling_smape_p90": np.nan,
+            "rolling_bias_pct_mean": np.nan,
+            "rolling_uplift_error_pct_median": np.nan,
+            "rolling_uplift_error_pct_lower": np.nan,
+            "rolling_uplift_error_pct_upper": np.nan,
+        }
+
+    valid_uplift_errs = cv_fold_df["uplift_error_pct"].dropna()
+    if len(valid_uplift_errs) >= 2:
+        lower, upper = np.percentile(valid_uplift_errs, [2.5, 97.5])
+        lower, upper = float(lower), float(upper)
+    else:
+        lower = upper = np.nan
+
+    return {
+        "rolling_smape_p90": float(np.percentile(cv_fold_df["smape"], 90)),
+        "rolling_bias_pct_mean": float(cv_fold_df["bias_pct"].mean()),
+        "rolling_uplift_error_pct_median": float(np.median(valid_uplift_errs)) if len(valid_uplift_errs) else np.nan,
+        "rolling_uplift_error_pct_lower": lower,
+        "rolling_uplift_error_pct_upper": upper,
+    }
+
+def _run_placebo_windows(model_pre, model_feature_cols, dates_pre, min_training_periods, placebo_len, method_name):
+    """
+    Simulates a fake intervention across all available historical pre-period windows
+    ("placebo testing"): repeatedly trains on an expanding window and evaluates on the
+    next placebo_len periods, using the same model type as the main fit. Never falls
+    back to regular KFold for time-series data — see build_regularized_model().
+
+    Returns four parallel lists (placebos, placebo_uplift_pcts, placebo_smapes,
+    placebo_rmses), one entry per placebo window. All empty if placebo_len is missing/
+    non-positive or there isn't enough pre-period history for even one window.
+    """
+    placebos, placebo_uplift_pcts, placebo_smapes, placebo_rmses = [], [], [], []
+
+    if placebo_len is None or placebo_len <= 0:
+        return placebos, placebo_uplift_pcts, placebo_smapes, placebo_rmses
+
+    n_pre = len(dates_pre)
+    if n_pre < placebo_len + min_training_periods:
+        return placebos, placebo_uplift_pcts, placebo_smapes, placebo_rmses
+
+    all_starts = list(range(min_training_periods, n_pre - placebo_len + 1))
+    if len(all_starts) > 20:
+        step = len(all_starts) // 20
+        all_starts = all_starts[::step][:20]
+
+    for start_idx in all_starts:
+        train_dates = dates_pre[:start_idx]
+        test_dates = dates_pre[start_idx:start_idx + placebo_len]
+        # Slice from the already-lagged pre-period matrix — this preserves lagged
+        # features computed from the full continuous series rather than recomputing
+        # (and losing the first row of) each placebo window independently.
+        m_train = model_pre[(model_pre["date"] >= train_dates[0]) & (model_pre["date"] <= train_dates[-1])]
+        m_test = model_pre[(model_pre["date"] >= test_dates[0]) & (model_pre["date"] <= test_dates[-1])]
+        if len(m_train) < min_training_periods or m_test.empty:
+            continue
+
+        X_tr = m_train[model_feature_cols].values
+        y_tr = m_train["test_kpi"].values
+        X_te = m_test[model_feature_cols].values
+        y_te = m_test["test_kpi"].values
+        scaler_p = StandardScaler()
+        X_tr_scaled = scaler_p.fit_transform(X_tr)
+        model_p, _placebo_cv_status, _placebo_used_cv = build_regularized_model(method_name, len(y_tr), n_splits_pref=3)
+        model_p.fit(X_tr_scaled, y_tr)
+        pred_p = model_p.predict(scaler_p.transform(X_te))
+
+        uplift_p = y_te.sum() - pred_p.sum()
+        placebos.append(uplift_p)
+        pred_sum = pred_p.sum()
+        placebo_uplift_pcts.append((uplift_p / pred_sum) * 100 if pred_sum != 0 else np.nan)
+        placebo_smapes.append(smape(y_te, pred_p))
+        placebo_rmses.append(np.sqrt(mean_squared_error(y_te, pred_p)))
+
+    return placebos, placebo_uplift_pcts, placebo_smapes, placebo_rmses
+
+def _summarize_placebo_results(placebos, placebo_uplift_pcts, placebo_smapes, placebo_rmses, uplift):
+    """
+    Summarizes the raw per-window placebo lists from _run_placebo_windows() into the
+    metrics shown in the "Placebo Testing" and "Observed Uplift vs Placebos" table
+    sections: the median/95% range of placebo uplift, placebo forecast error, and (if
+    an observed uplift is available) how extreme that observed uplift is relative to
+    the placebo distribution (percentile rank, one/two-sided p-values, z-score).
+
+    Returns a dict; all values are np.nan if there are no placebo windows.
+    """
+    if not placebos:
+        return {
+            "median_uplift": np.nan, "p2_5": np.nan, "p97_5": np.nan,
+            "median_placebo_smape": np.nan, "p95_placebo_smape": np.nan,
+            "median_placebo_rmse": np.nan, "p95_placebo_rmse": np.nan,
+            "median_placebo_uplift_pct": np.nan, "p2_5_pct": np.nan, "p97_5_pct": np.nan,
+            "percentile_rank": np.nan, "p_one_sided": np.nan, "p_two_sided": np.nan, "z_score": np.nan,
+        }
+
+    median_uplift = np.median(placebos)
+    p2_5, p97_5 = np.percentile(placebos, [2.5, 97.5])
+    median_placebo_smape = np.median(placebo_smapes) if placebo_smapes else np.nan
+    p95_placebo_smape = np.percentile(placebo_smapes, 95) if placebo_smapes else np.nan
+    median_placebo_rmse = np.median(placebo_rmses) if placebo_rmses else np.nan
+    p95_placebo_rmse = np.percentile(placebo_rmses, 95) if placebo_rmses else np.nan
+    median_placebo_uplift_pct = np.median(placebo_uplift_pcts) if placebo_uplift_pcts else np.nan
+    p2_5_pct, p97_5_pct = np.percentile(placebo_uplift_pcts, [2.5, 97.5]) if placebo_uplift_pcts else (np.nan, np.nan)
+
+    if uplift is not None:
+        percentile_rank = np.mean(np.array(placebos) < uplift) * 100
+        p_one_sided = np.mean(np.array(placebos) >= uplift)
+        mean_placebo = np.mean(placebos)
+        p_two_sided = np.mean(np.abs(np.array(placebos) - mean_placebo) >= np.abs(uplift - mean_placebo))
+        z_score = (uplift - mean_placebo) / (np.std(placebos) + 1e-12)
+    else:
+        percentile_rank = p_one_sided = p_two_sided = z_score = np.nan
+
+    return {
+        "median_uplift": median_uplift, "p2_5": p2_5, "p97_5": p97_5,
+        "median_placebo_smape": median_placebo_smape, "p95_placebo_smape": p95_placebo_smape,
+        "median_placebo_rmse": median_placebo_rmse, "p95_placebo_rmse": p95_placebo_rmse,
+        "median_placebo_uplift_pct": median_placebo_uplift_pct, "p2_5_pct": p2_5_pct, "p97_5_pct": p97_5_pct,
+        "percentile_rank": percentile_rank, "p_one_sided": p_one_sided, "p_two_sided": p_two_sided, "z_score": z_score,
+    }
 
 def run_validation_method(agg_df, control_list, test_regions, method_name,
                           pre_start, pre_end, test_start=None, test_end=None,
@@ -1024,23 +1223,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
 
     # ---- Row-loss diagnostics: warn when a meaningful share of rows were dropped because
     # the test series or a selected control had missing KPI values for some dates. ----
-    _pct_dropped = matrix_diagnostics.get("pct_rows_dropped", 0.0)
-    _rows_dropped = matrix_diagnostics.get("rows_dropped", 0)
-    _rows_before = matrix_diagnostics.get("rows_before_dropna", 0)
-    if _rows_dropped > 0 and _pct_dropped > 20:
-        st.error(
-            f"{_rows_dropped} of {_rows_before} rows ({_pct_dropped:.1f}%) were removed because "
-            "the test series or at least one selected control had missing KPI values. "
-            "This is a large share of the data and the validation result may be unreliable. "
-            f"Controls with missing values: {', '.join(matrix_diagnostics.get('control_columns_with_missing', [])) or 'none'}."
-        )
-    elif _rows_dropped > 0 and _pct_dropped > 10:
-        st.warning(
-            f"{_rows_dropped} of {_rows_before} rows ({_pct_dropped:.1f}%) were removed because "
-            "the test series or at least one selected control had missing KPI values. "
-            "This can affect validation reliability. "
-            f"Controls with missing values: {', '.join(matrix_diagnostics.get('control_columns_with_missing', [])) or 'none'}."
-        )
+    _warn_on_row_loss(matrix_diagnostics)
 
     if include_lagged_controls:
         model_full, model_feature_cols, lagged_feature_map, lag_drop_metadata = add_lagged_control_features(
@@ -1096,42 +1279,17 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     # already np.nan in that case, and Counterfactual Reliability naturally reports
     # "Insufficient data" rather than a misleading rating based on an arbitrary alpha.
     cv_status = f"Main model: {main_model_cv_status} Rolling-origin folds: {rolling_cv_status}"
-    if main_model_used_cv_fallback:
-        st.warning(
-            f"⚠️ There is insufficient pre-period history to run leakage-free TimeSeriesSplit "
-            f"cross-validation for **{method_name}**. This method has not been given a "
-            "reliability rating. Add more pre-period data or reduce the validation window."
-        )
-    elif not fold_df.empty and bool(fold_df["used_cv_fallback"].any()):
-        _n_fallback_folds = int(fold_df["used_cv_fallback"].sum())
-        st.warning(
-            f"⚠️ {_n_fallback_folds} of {len(fold_df)} rolling-origin folds for **{method_name}** "
-            "did not have enough training history for leakage-free TimeSeriesSplit cross-validation. "
-            "Those folds were fit exploratorily with a fixed regularisation strength and are excluded "
-            "from the rolling-origin validation metrics and Counterfactual Reliability shown here."
-        )
+    _warn_on_cv_fallback(method_name, main_model_used_cv_fallback, fold_df)
 
     # Additional rolling-origin summary stats. These also exclude exploratory fixed-alpha
     # folds, since Rolling-Origin Bias (%) directly feeds Counterfactual Reliability and
     # should not be contaminated by a non-cross-validated fit.
-    if not fold_df.empty:
-        cv_fold_df = fold_df[~fold_df["used_cv_fallback"]]
-    else:
-        cv_fold_df = fold_df
-    if not cv_fold_df.empty:
-        rolling_smape_p90 = float(np.percentile(cv_fold_df["smape"], 90))
-        rolling_bias_pct_mean = float(cv_fold_df["bias_pct"].mean())
-        valid_uplift_errs = cv_fold_df["uplift_error_pct"].dropna()
-        rolling_uplift_error_pct_median = float(np.median(valid_uplift_errs)) if len(valid_uplift_errs) else np.nan
-        if len(valid_uplift_errs) >= 2:
-            rolling_uplift_error_pct_lower, rolling_uplift_error_pct_upper = np.percentile(valid_uplift_errs, [2.5, 97.5])
-            rolling_uplift_error_pct_lower = float(rolling_uplift_error_pct_lower)
-            rolling_uplift_error_pct_upper = float(rolling_uplift_error_pct_upper)
-        else:
-            rolling_uplift_error_pct_lower = rolling_uplift_error_pct_upper = np.nan
-    else:
-        rolling_smape_p90 = rolling_bias_pct_mean = np.nan
-        rolling_uplift_error_pct_median = rolling_uplift_error_pct_lower = rolling_uplift_error_pct_upper = np.nan
+    _rolling_summary = _summarize_rolling_origin_folds(fold_df)
+    rolling_smape_p90 = _rolling_summary["rolling_smape_p90"]
+    rolling_bias_pct_mean = _rolling_summary["rolling_bias_pct_mean"]
+    rolling_uplift_error_pct_median = _rolling_summary["rolling_uplift_error_pct_median"]
+    rolling_uplift_error_pct_lower = _rolling_summary["rolling_uplift_error_pct_lower"]
+    rolling_uplift_error_pct_upper = _rolling_summary["rolling_uplift_error_pct_upper"]
 
     # ---- Overfitting Gap (part 1): compare pre-period (in-sample) fit against
     # rolling-origin (out-of-sample) accuracy. A large gap means the model looks good
@@ -1187,11 +1345,6 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     neg_post = any(y_post_pred < 0) if y_post_pred is not None else False
 
     # ---------- Placebo generation (using the same model type) ----------
-    placebos = []
-    placebo_uplift_pcts = []
-    placebo_smapes = []
-    placebo_rmses = []
-
     if compute_uplift:
         if placebo_length_periods is not None:
             placebo_len = placebo_length_periods
@@ -1209,73 +1362,26 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     else:
         placebo_len = None
 
-    if placebo_len is not None and placebo_len > 0:
-        # Use row-based sliding: we have dates_pre sorted
-        n_pre = len(dates_pre)
-        # We need at least min_training_periods before the placebo window
-        if n_pre >= placebo_len + min_training_periods:
-            _all_placebo_starts = list(range(min_training_periods, n_pre - placebo_len + 1))
-            if len(_all_placebo_starts) > 20:
-                _step = len(_all_placebo_starts) // 20
-                _all_placebo_starts = _all_placebo_starts[::_step][:20]
-            for start_idx in _all_placebo_starts:
-                # train: indices 0..start_idx-1
-                # test: indices start_idx .. start_idx+placebo_len-1
-                train_dates = dates_pre[:start_idx]
-                test_dates = dates_pre[start_idx:start_idx+placebo_len]
-                # Slice from the already-lagged pre-period matrix — this preserves lagged
-                # features computed from the full continuous series rather than recomputing
-                # (and losing the first row of) each placebo window independently.
-                m_train = model_pre[(model_pre["date"] >= train_dates[0]) & (model_pre["date"] <= train_dates[-1])]
-                m_test = model_pre[(model_pre["date"] >= test_dates[0]) & (model_pre["date"] <= test_dates[-1])]
-                if len(m_train) >= min_training_periods and not m_test.empty:
-                    X_tr = m_train[model_feature_cols].values
-                    y_tr = m_train["test_kpi"].values
-                    X_te = m_test[model_feature_cols].values
-                    y_te = m_test["test_kpi"].values
-                    scaler_p = StandardScaler()
-                    X_tr_scaled = scaler_p.fit_transform(X_tr)
-                    # Use the same model type as main. Never falls back to regular KFold for
-                    # time-series data — see build_regularized_model().
-                    model_p, _placebo_cv_status, _placebo_used_cv = build_regularized_model(method_name, len(y_tr), n_splits_pref=3)
-                    model_p.fit(X_tr_scaled, y_tr)
-                    pred_p = model_p.predict(scaler_p.transform(X_te))
-                    uplift_p = y_te.sum() - pred_p.sum()
-                    placebos.append(uplift_p)
-                    pred_sum = pred_p.sum()
-                    if pred_sum != 0:
-                        uplift_pct_p = (uplift_p / pred_sum) * 100
-                    else:
-                        uplift_pct_p = np.nan
-                    placebo_uplift_pcts.append(uplift_pct_p)
-                    placebo_smapes.append(smape(y_te, pred_p))
-                    placebo_rmses.append(np.sqrt(mean_squared_error(y_te, pred_p)))
+    placebos, placebo_uplift_pcts, placebo_smapes, placebo_rmses = _run_placebo_windows(
+        model_pre, model_feature_cols, dates_pre, min_training_periods, placebo_len, method_name
+    )
 
     # Placebo summary statistics (use the same functions)
-    if placebos:
-        median_uplift = np.median(placebos)
-        p2_5, p97_5 = np.percentile(placebos, [2.5, 97.5])
-        median_placebo_smape = np.median(placebo_smapes) if placebo_smapes else np.nan
-        p95_placebo_smape = np.percentile(placebo_smapes, 95) if placebo_smapes else np.nan
-        median_placebo_rmse = np.median(placebo_rmses) if placebo_rmses else np.nan
-        p95_placebo_rmse = np.percentile(placebo_rmses, 95) if placebo_rmses else np.nan
-        median_placebo_uplift_pct = np.median(placebo_uplift_pcts) if placebo_uplift_pcts else np.nan
-        p2_5_pct, p97_5_pct = np.percentile(placebo_uplift_pcts, [2.5, 97.5]) if placebo_uplift_pcts else (np.nan, np.nan)
-        # Compute p-values
-        if uplift is not None:
-            percentile_rank = np.mean(np.array(placebos) < uplift) * 100
-            p_one_sided = np.mean(np.array(placebos) >= uplift)
-            mean_placebo = np.mean(placebos)
-            p_two_sided = np.mean(np.abs(np.array(placebos) - mean_placebo) >= np.abs(uplift - mean_placebo))
-            z_score = (uplift - mean_placebo) / (np.std(placebos) + 1e-12)
-        else:
-            percentile_rank = p_one_sided = p_two_sided = z_score = np.nan
-    else:
-        median_uplift = p2_5 = p97_5 = np.nan
-        median_placebo_smape = p95_placebo_smape = np.nan
-        median_placebo_rmse = p95_placebo_rmse = np.nan
-        median_placebo_uplift_pct = p2_5_pct = p97_5_pct = np.nan
-        percentile_rank = p_one_sided = p_two_sided = z_score = np.nan
+    _placebo_summary = _summarize_placebo_results(placebos, placebo_uplift_pcts, placebo_smapes, placebo_rmses, uplift)
+    median_uplift = _placebo_summary["median_uplift"]
+    p2_5 = _placebo_summary["p2_5"]
+    p97_5 = _placebo_summary["p97_5"]
+    median_placebo_smape = _placebo_summary["median_placebo_smape"]
+    p95_placebo_smape = _placebo_summary["p95_placebo_smape"]
+    median_placebo_rmse = _placebo_summary["median_placebo_rmse"]
+    p95_placebo_rmse = _placebo_summary["p95_placebo_rmse"]
+    median_placebo_uplift_pct = _placebo_summary["median_placebo_uplift_pct"]
+    p2_5_pct = _placebo_summary["p2_5_pct"]
+    p97_5_pct = _placebo_summary["p97_5_pct"]
+    percentile_rank = _placebo_summary["percentile_rank"]
+    p_one_sided = _placebo_summary["p_one_sided"]
+    p_two_sided = _placebo_summary["p_two_sided"]
+    z_score = _placebo_summary["z_score"]
 
     # Report selected (non-zero coefficient) features for BOTH LASSO and Elastic Net.
     # Elastic Net can also shrink coefficients to ~0 depending on l1_ratio, so it should
@@ -2051,7 +2157,9 @@ if "match_results_stale" not in st.session_state:
 try:
     available_markets = sorted(get_workbook_sheet_names(DATA_PATH))
 except Exception as e:
-    st.error(f"Error loading Excel workbook: {str(e)}")
+    st.error("We couldn't load the geography/population data file this app relies on. Please check that the data file is present and correctly formatted.")
+    with st.expander("Technical details"):
+        st.code(f"{type(e).__name__}: {e}")
     st.stop()
 
 _default_market_index = available_markets.index("UK") if "UK" in available_markets else 0
@@ -2066,7 +2174,9 @@ try:
     market_df = prepare_market_dataframe(market_df_raw)
     grouping_options = get_grouping_columns(market_df)
 except Exception as e:
-    st.error(f"Error preparing market sheet '{market}': {type(e).__name__}: {str(e)}")
+    st.error(f"We couldn't prepare the data for market '{market}'. Please check that this market's sheet is formatted correctly.")
+    with st.expander("Technical details"):
+        st.code(f"{type(e).__name__}: {e}")
     st.stop()
 
 with st.sidebar:
@@ -2987,7 +3097,9 @@ with tab1:
                         )
                         st.success(f"✅ Export ready — {len(_lookup)} geographies, {_n_test} test, {_n_ctrl} control.")
                     except Exception as e:
-                        st.error(f"Error creating export: {str(e)}")
+                        st.error("We couldn't create the Excel export. Please try again, and check that a valid control group has been selected.")
+                        with st.expander("Technical details"):
+                            st.code(f"{type(e).__name__}: {e}")
             with col2:
                 if st.button("📋 Copy Summary to Clipboard", width='stretch'):
 
@@ -2999,6 +3111,343 @@ with tab1:
 # TAB 2: DESIGN FUTURE GEO TEST
 # TAB 3: EVALUATE COMPLETED GEO TEST
 # =============================================================================
+
+def render_method_comparison_table(results, mode, test_start, control_regions_val):
+    """
+    Renders the Method Comparison table (traffic-light diagnostics per method),
+    its captions, and the "How to interpret these results" expander.
+
+    Extracted from render_time_series_validation() as a self-contained rendering
+    step: it only reads from `results` (the dict of per-method result dicts built by
+    run_validation_method()), `mode` ("Design" or "Evaluate"), `test_start`, and
+    `control_regions_val` — it does not depend on any other local state from the
+    caller. METHOD_STRUCTURAL / METHOD_USER_SELECTED are module-level constants.
+    """
+    # ---- Method Comparison table ----
+    st.subheader("Method Comparison")
+
+    RELIABILITY_LABELS = {
+        "Strong": "🟢 Strong",
+        "Caution": "🟠 Caution",
+        "Weak": "🔴 Weak",
+        "Insufficient data": "⚪ Insufficient data",
+    }
+
+    comparison_rows = [
+        {"Metric": "A. CONTROL SELECTION", "is_section": True},
+        {"Metric": "Control Pool Size", "key": "control_pool_size"},
+        {"Metric": "Controls Selected", "key": "controls_selected"},
+        {"Metric": "Selected Features", "key": "n_selected_features"},
+
+        {"Metric": "B. PRE-PERIOD FIT", "is_section": True},
+        {"Metric": "Pre-Period Correlation", "key": "pre_corr"},
+        {"Metric": "Pre-Period R²", "key": "pre_r2"},
+        {"Metric": "Pre-Period sMAPE (%)", "key": "pre_smape"},
+        {"Metric": "Pre-Period RMSE", "key": "pre_rmse"},
+
+        {"Metric": "C. ROLLING VALIDATION", "is_section": True},
+        {"Metric": "Validation Method", "key": "validation_method_label"},
+        {"Metric": "Rolling Validation sMAPE (%)", "key": "holdout_smape"},
+        {"Metric": "Rolling Validation Error", "key": "rolling_validation_error_risk"},
+        {"Metric": "Rolling-Origin sMAPE — Worst Case (P90)", "key": "rolling_smape_p90"},
+        {"Metric": "Rolling Validation RMSE", "key": "holdout_rmse"},
+        {"Metric": "Rolling Bias (%)", "key": "rolling_bias_pct_mean"},
+        {"Metric": "Rolling Bias Risk", "key": "rolling_bias_risk"},
+
+        {"Metric": "D. OVERFITTING CHECK", "is_section": True},
+        {"Metric": "Overfitting Gap, sMAPE percentage points", "key": "overfit_gap_smape"},
+        {"Metric": "Overfitting Risk", "key": "overfitting_risk"},
+
+        {"Metric": "E. RESIDUAL DIAGNOSTICS", "is_section": True},
+        {"Metric": "Durbin-Watson", "key": "dw_stat"},
+        {"Metric": "Autocorrelation Risk", "key": "autocorrelation_risk"},
+
+        {"Metric": "F. OVERALL RELIABILITY", "is_section": True},
+        {"Metric": "Counterfactual Reliability", "key": "counterfactual_reliability"},
+        {"Metric": "Reliability Drivers", "key": "reliability_drivers"},
+
+        {"Metric": "G. PLACEBO TESTING", "is_section": True},
+        {"Metric": "Placebo Windows", "key": "placebo_windows"},
+        {"Metric": "Median Placebo Uplift", "key": "median_placebo_uplift_pct"},
+        {"Metric": "95% Placebo Uplift Range", "key": "placebo_range_pct"},
+        {"Metric": "Placebo Forecast Error — avg sMAPE", "key": "median_placebo_smape"},
+        {"Metric": "Placebo Forecast Error — worst case (P95)", "key": "p95_placebo_smape"},
+    ]
+    show_test_impact = (mode == "Evaluate" and test_start is not None)
+    if show_test_impact:
+        comparison_rows += [
+            {"Metric": "G. OBSERVED UPLIFT VS PLACEBOS", "is_section": True},
+            {"Metric": "Observed Uplift Percentile vs Placebos", "key": "placebo_percentile_rank"},
+            {"Metric": "Observed Uplift p-value", "key": "placebo_p_two_sided"},
+            {"Metric": "Observed Uplift z-score", "key": "placebo_z_score"},
+            {"Metric": "H. TEST IMPACT", "is_section": True},
+            {"Metric": "Observed Uplift", "key": "observed_uplift"},
+            {"Metric": "Observed Uplift (%)", "key": "observed_uplift_pct"},
+            {"Metric": "Test Period Actual (total)", "key": "test_period_actual"},
+            {"Metric": "Test Period Counterfactual (total)", "key": "test_period_counterfactual"},
+        ]
+
+    def _fmt_pct(v, decimals=1):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return "N/A"
+        return f"{v:.{decimals}f}%"
+
+    def _fmt_num(v, decimals=1):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return "N/A"
+        return f"{v:.{decimals}f}"
+
+    def get_value(key, res, method_name):
+        if key == "control_pool_size":
+            if method_name in [METHOD_STRUCTURAL, METHOD_USER_SELECTED]:
+                return str(len(control_regions_val))
+            else:
+                return str(res['n_candidates'])
+        elif key == "controls_selected":
+            if method_name in [METHOD_STRUCTURAL, METHOD_USER_SELECTED]:
+                return str(len(control_regions_val))
+            else:
+                return str(res['n_selected'])
+        elif key == "n_selected_features":
+            v = res.get("n_selected_features", None)
+            return str(v) if v is not None else "N/A"
+        elif key == "validation_method_label":
+            return res.get("validation_method_label", "⚪ Insufficient validation history")
+        elif key == "pre_corr":
+            return _fmt_num(res.get('corr', np.nan), decimals=3)
+        elif key == "pre_r2":
+            return _fmt_num(res.get('r2', np.nan), decimals=3)
+        elif key == "pre_smape":
+            return _fmt_pct(res.get('smape', np.nan))
+        elif key == "pre_rmse":
+            return _fmt_num(res.get('rmse', np.nan))
+        elif key == "dw_stat":
+            dw = res.get("dw_stat", np.nan)
+            if dw is None or (isinstance(dw, float) and np.isnan(dw)):
+                return "N/A"
+            return f"{dw:.2f}"
+        elif key == "autocorrelation_risk":
+            return res.get("autocorrelation_risk", "⚪ Insufficient data")
+        elif key == "holdout_smape":
+            return _fmt_pct(res.get('holdout_smape_mean', np.nan))
+        elif key == "rolling_validation_error_risk":
+            return res.get("rolling_validation_error_risk", "⚪ Insufficient data")
+        elif key == "holdout_rmse":
+            return _fmt_num(res.get('holdout_rmse_mean', np.nan))
+        elif key == "rolling_smape_p90":
+            return _fmt_pct(res.get("rolling_smape_p90", np.nan))
+        elif key == "rolling_bias_pct_mean":
+            return _fmt_pct(res.get("rolling_bias_pct_mean", np.nan))
+        elif key == "rolling_bias_risk":
+            return res.get("rolling_bias_risk", "⚪ Insufficient data")
+        elif key == "overfit_gap_smape":
+            v = res.get("overfit_gap_smape", np.nan)
+            return f"{v:.1f} pp" if not (v is None or (isinstance(v, float) and np.isnan(v))) else "N/A"
+        elif key == "overfit_gap_rmse":
+            return _fmt_num(res.get("overfit_gap_rmse", np.nan))
+        elif key == "overfitting_risk":
+            return res.get("overfitting_risk", "⚪ Insufficient data")
+        elif key == "reliability_drivers":
+            return res.get("reliability_drivers", "⚪ Insufficient data: rolling validation unavailable")
+        elif key == "counterfactual_reliability":
+            reliability = res.get("counterfactual_reliability", None)
+            return RELIABILITY_LABELS.get(reliability, "N/A")
+        elif key == "placebo_windows":
+            return str(len(res['placebos']))
+        elif key == "median_placebo_uplift_pct":
+            return _fmt_pct(res.get('median_placebo_uplift_pct', np.nan))
+        elif key == "placebo_range_pct":
+            return format_range(res.get('placebo_range_lower_pct', np.nan), res.get('placebo_range_upper_pct', np.nan), suffix="%", decimals=1)
+        elif key == "median_placebo_smape":
+            return _fmt_pct(res.get('median_placebo_smape', np.nan))
+        elif key == "p95_placebo_smape":
+            return _fmt_pct(res.get('p95_placebo_smape', np.nan))
+        elif key == "placebo_percentile_rank":
+            return _fmt_pct(res.get('placebo_percentile_rank', np.nan))
+        elif key == "placebo_p_two_sided":
+            return _fmt_num(res.get('placebo_p_value_two_sided', np.nan), decimals=3)
+        elif key == "placebo_z_score":
+            return _fmt_num(res.get('placebo_z_score', np.nan), decimals=2)
+        elif key == "observed_uplift":
+            return _fmt_num(res.get('uplift', np.nan))
+        elif key == "observed_uplift_pct":
+            return _fmt_pct(res.get('uplift_pct', np.nan))
+        elif key == "test_period_actual":
+            y_test_actual = res.get('y_test_actual', None)
+            if y_test_actual is None or len(y_test_actual) == 0:
+                return "N/A"
+            return _fmt_num(float(np.sum(y_test_actual)))
+        elif key == "test_period_counterfactual":
+            y_pred_test = res.get('y_pred_test', None)
+            if y_pred_test is None or len(y_pred_test) == 0:
+                return "N/A"
+            return _fmt_num(float(np.sum(y_pred_test)))
+        else:
+            return "N/A"
+
+    table_data = []
+    method_names = list(results.keys())
+    for row in comparison_rows:
+        if row.get("is_section", False):
+            new_row = {"Metric": row["Metric"]}
+            for m in method_names:
+                new_row[m] = ""
+            table_data.append(new_row)
+        else:
+            new_row = {"Metric": row["Metric"]}
+            for m in method_names:
+                new_row[m] = get_value(row["key"], results[m], m)
+            table_data.append(new_row)
+
+    comp_df_val = pd.DataFrame(table_data)
+    def style_section_rows(row):
+        if row["Metric"] in [r["Metric"] for r in comparison_rows if r.get("is_section", False)]:
+            return ["font-weight: bold; background-color: #f0f2f6"] * len(row)
+        return [""] * len(row)
+    styled_comp = comp_df_val.style.apply(style_section_rows, axis=1)
+    st.dataframe(styled_comp, width='stretch', hide_index=False)
+
+    st.caption(
+        "Durbin-Watson checks whether residuals are autocorrelated. Values near 2 are good. Values far "
+        "below or above 2 suggest the model is missing time patterns."
+    )
+    st.caption(
+        "**Overfitting Gap** compares the model's in-sample pre-period error with its held-out rolling "
+        "validation error. A large positive gap means the model looks good on the data it was fitted on, "
+        "but performs worse when predicting unseen historical periods."
+    )
+    st.caption(
+        "**Rolling Validation Error** shows whether the model can predict held-out historical periods. "
+        "Lower is better."
+    )
+    st.caption(
+        "**Rolling Bias** checks whether the model systematically over- or under-predicts in held-out "
+        "historical periods."
+    )
+    st.caption(
+        "**Counterfactual Reliability** is the overall traffic-light summary. It takes the worst result "
+        "from the main validation checks: rolling validation error, overfitting gap, rolling bias, and "
+        "residual autocorrelation. **Reliability Drivers** explains which check(s) drove the rating. "
+        "Traffic-light bands are interpretation aids based on validation diagnostics — they are not "
+        "standalone hypothesis tests."
+    )
+    st.caption(
+        "⚪ **Insufficient data** means there were not enough rolling-origin validation windows to assess "
+        "whether the model generalises out-of-sample. Treat this with caution, especially for "
+        "completed-test evaluation."
+    )
+    st.caption(
+        "Placebo uplift ranges are based on historical fake-test windows. They show how much apparent "
+        "uplift could occur when no real intervention happened. If the observed test uplift sits inside "
+        "this range, it may not be distinguishable from normal historical noise. Placebo testing is a "
+        "separate robustness check and is not folded into Counterfactual Reliability."
+    )
+
+    # ---- Interpretation help ----
+    with st.expander("How to interpret these results", expanded=False):
+        if mode == "Design":
+            st.markdown(f"""
+**Validate Test Design — How to read this**
+
+The goal here is to assess whether your control group can reliably predict what would have happened to your test regions without any intervention. If it can, you can have more confidence in a future uplift estimate.
+
+---
+
+**Step 1 — Start with Rolling-Origin Validation**
+
+This checks whether the model can predict held-out historical periods using only earlier data. It is the main evidence that the counterfactual model generalises, and is far more trustworthy than pre-period fit alone.
+
+- **Rolling-Origin sMAPE (%)** — Typical percentage error when predicting the test KPI from controls. Aim for below 10%. Above 20% suggests the control group is a poor predictor.
+- **Rolling-Origin sMAPE — Worst Case (P90)** — The error in the weakest 10% of forecast windows. Even if the average looks fine, a high P90 means the model breaks down in certain periods.
+- **Rolling-Origin Bias (%)** — Whether the model consistently overshoots or undershoots. Anything beyond ±5% is a warning sign: the counterfactual will be structurally biased even if sMAPE looks acceptable.
+
+---
+
+**Step 2 — Check Overfitting / Reliability Checks**
+
+A method can look excellent in-sample and still be unreliable if it's fitting coincidental historical patterns rather than a genuine relationship.
+
+- **Overfitting Gap, sMAPE percentage points** — Compares the model's in-sample pre-period error with its held-out rolling validation error. A large positive gap (roughly above 3–8 percentage points) means the model looks good on the data it was fitted on, but performs worse when predicting unseen historical periods. This is a validation diagnostic, not a formal statistical test.
+- **Overfitting Risk** — A short traffic-light rating based only on the Overfitting Gap: does the model look meaningfully worse on held-out historical validation than on the fitted pre-period?
+- **Durbin-Watson** / **Autocorrelation Risk** — Durbin-Watson is an established statistic for first-order residual autocorrelation. Values near 2 suggest little autocorrelation; values materially below or above 2 suggest the model is missing time patterns. The traffic-light label is an interpretation band, not a formal critical-value test.
+- **Counterfactual Reliability** — The overall traffic-light summary. It takes the worst result from the main validation checks: Rolling Validation Error, Overfitting Risk, Rolling Bias Risk, and Autocorrelation Risk. **Reliability Drivers** explains which check(s) drove the rating. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess this — this is a data-availability gap, not evidence that reliability is strong.
+
+**How to read the reliability checks**
+
+1. **Rolling Validation Error** checks whether the model predicts held-out historical periods accurately.
+2. **Overfitting Risk** checks whether the model performs much worse on held-out periods than it does on the fitted pre-period.
+3. **Rolling Bias Risk** checks whether the model systematically over- or under-predicts.
+4. **Autocorrelation Risk** checks whether residuals still contain time patterns.
+5. **Counterfactual Reliability** takes the worst of these checks as the overall rating.
+
+Traffic-light bands are interpretation aids based on validation diagnostics. They are not standalone hypothesis tests.
+
+---
+
+**Step 3 — Review Placebo Testing**
+
+Placebo tests simulate running a fake intervention across all available historical windows. A well-behaved model produces placebo uplifts clustered near zero.
+
+- **Median Placebo Uplift** — Should be close to 0%. Large values mean the model consistently finds phantom effects.
+- **95% Placebo Uplift Range** — The full spread of placebo (fake-test) uplifts. **This is your rough minimum detectable effect:** if your target uplift is smaller than this range, the design may lack power to distinguish a real signal from historical noise. A wide range also means the model is volatile — your real test uplift will need to sit clearly outside it to be credible.
+
+---
+
+**Step 4 — Use Pre-Period Fit as a sanity check only**
+
+Pre-period Correlation is shown for reference but can be misleadingly high — a model can fit the pre-period well and still fail out-of-sample. Always weight the rolling-origin metrics more heavily.
+
+**Durbin-Watson** is an established statistic for first-order residual autocorrelation in the model's pre-period residuals. It is around 2.0 when residuals have little autocorrelation; values below 2 suggest positive autocorrelation, values above 2 suggest negative autocorrelation. Strong autocorrelation is a sign the model is missing structure in the data (e.g. trends or delayed effects) that the standard errors don't account for.
+
+---
+
+**Rule of thumb:** Low rolling-origin sMAPE + Strong/Caution Counterfactual Reliability + a narrow, tight placebo distribution = a reliable test design ready to run.
+            """)
+        else:
+            st.markdown("""
+**Measure Test Impact — How to read this**
+
+Before trusting the uplift estimate, verify the model can reliably predict the test KPI. An unreliable model produces an unreliable uplift number.
+
+---
+
+**Step 1 — Verify the model is trustworthy**
+
+Start with Rolling-Origin Validation. This checks whether the model can predict held-out historical periods using only earlier data. It is the main evidence that the counterfactual model generalises.
+
+- **Rolling-Origin sMAPE (%)** — Typical out-of-sample prediction error. If this is above 15–20%, treat the uplift estimate with caution — the counterfactual baseline is uncertain.
+- **Rolling-Origin Bias (%)** — Persistent bias in the model's predictions. A model that consistently undershoots will overstate uplift, and vice versa.
+- **Counterfactual Reliability** — The overall traffic-light summary. It takes the worst result from the main validation checks: Rolling Validation Error, Overfitting Risk, Rolling Bias Risk, and Autocorrelation Risk. **Reliability Drivers** explains which check(s) drove the rating. If this is "Weak", treat the uplift number with extra caution, particularly for data-optimised methods. If it shows "Insufficient data", there wasn't enough rolling-origin history to assess this at all — treat the uplift with the same caution you would give a "Weak" result. The traffic-light label is an interpretation aid, not a formal statistical test.
+- **95% Placebo Uplift Range** — The range of apparent uplifts the model detects in historical periods with no intervention. Your observed uplift needs to sit clearly outside this range.
+
+**How to read the reliability checks**
+
+1. **Rolling Validation Error** checks whether the model predicts held-out historical periods accurately.
+2. **Overfitting Risk** checks whether the model performs much worse on held-out periods than it does on the fitted pre-period.
+3. **Rolling Bias Risk** checks whether the model systematically over- or under-predicts.
+4. **Autocorrelation Risk** checks whether residuals still contain time patterns.
+5. **Counterfactual Reliability** takes the worst of these checks as the overall rating.
+
+Traffic-light bands are interpretation aids based on validation diagnostics. They are not standalone hypothesis tests.
+
+---
+
+**Step 2 — Assess the uplift result**
+
+- **Observed Uplift Percentile vs Placebos** — Where your observed uplift ranks relative to the distribution of historical placebo (fake-test) uplifts. 95th percentile or above is stronger evidence that the observed uplift is unusual relative to pre-period noise.
+- **Observed Uplift p-value** — The placebo p-value is an empirical extremeness check: it shows how unusual the observed uplift is relative to historical fake-test windows. It is not proof of causality and should be interpreted alongside model fit, rolling-origin validation, and business context. Below 0.05 is the conventional (approximate) threshold analysts use as a rule of thumb.
+
+---
+
+**Step 3 — Compare methods**
+
+If you ran multiple methods (Structural, Data-Optimised), look for agreement. When both methods produce similar uplift estimates, both show good out-of-sample fit, and both show Strong/Caution Counterfactual Reliability, confidence in the result is higher.
+
+---
+
+**Rule of thumb:** Low rolling-origin sMAPE + Strong/Caution Counterfactual Reliability + observed uplift outside the placebo range + a small p-value = a result with stronger evidence behind it, though still not proof of causality on its own.
+            """)
+
 
 def render_time_series_validation(mode: str):
     """
@@ -4124,330 +4573,9 @@ def render_time_series_validation(mode: str):
             fig.update_layout(yaxis_title=y_label)
             st.plotly_chart(fig, width='stretch')
 
-        # ---- Method Comparison table ----
-        st.subheader("Method Comparison")
-
-        RELIABILITY_LABELS = {
-            "Strong": "🟢 Strong",
-            "Caution": "🟠 Caution",
-            "Weak": "🔴 Weak",
-            "Insufficient data": "⚪ Insufficient data",
-        }
-
-        comparison_rows = [
-            {"Metric": "A. CONTROL SELECTION", "is_section": True},
-            {"Metric": "Control Pool Size", "key": "control_pool_size"},
-            {"Metric": "Controls Selected", "key": "controls_selected"},
-            {"Metric": "Selected Features", "key": "n_selected_features"},
-
-            {"Metric": "B. PRE-PERIOD FIT", "is_section": True},
-            {"Metric": "Pre-Period Correlation", "key": "pre_corr"},
-            {"Metric": "Pre-Period R²", "key": "pre_r2"},
-            {"Metric": "Pre-Period sMAPE (%)", "key": "pre_smape"},
-            {"Metric": "Pre-Period RMSE", "key": "pre_rmse"},
-
-            {"Metric": "C. ROLLING VALIDATION", "is_section": True},
-            {"Metric": "Validation Method", "key": "validation_method_label"},
-            {"Metric": "Rolling Validation sMAPE (%)", "key": "holdout_smape"},
-            {"Metric": "Rolling Validation Error", "key": "rolling_validation_error_risk"},
-            {"Metric": "Rolling-Origin sMAPE — Worst Case (P90)", "key": "rolling_smape_p90"},
-            {"Metric": "Rolling Validation RMSE", "key": "holdout_rmse"},
-            {"Metric": "Rolling Bias (%)", "key": "rolling_bias_pct_mean"},
-            {"Metric": "Rolling Bias Risk", "key": "rolling_bias_risk"},
-
-            {"Metric": "D. OVERFITTING CHECK", "is_section": True},
-            {"Metric": "Overfitting Gap, sMAPE percentage points", "key": "overfit_gap_smape"},
-            {"Metric": "Overfitting Risk", "key": "overfitting_risk"},
-
-            {"Metric": "E. RESIDUAL DIAGNOSTICS", "is_section": True},
-            {"Metric": "Durbin-Watson", "key": "dw_stat"},
-            {"Metric": "Autocorrelation Risk", "key": "autocorrelation_risk"},
-
-            {"Metric": "F. OVERALL RELIABILITY", "is_section": True},
-            {"Metric": "Counterfactual Reliability", "key": "counterfactual_reliability"},
-            {"Metric": "Reliability Drivers", "key": "reliability_drivers"},
-
-            {"Metric": "G. PLACEBO TESTING", "is_section": True},
-            {"Metric": "Placebo Windows", "key": "placebo_windows"},
-            {"Metric": "Median Placebo Uplift", "key": "median_placebo_uplift_pct"},
-            {"Metric": "95% Placebo Uplift Range", "key": "placebo_range_pct"},
-            {"Metric": "Placebo Forecast Error — avg sMAPE", "key": "median_placebo_smape"},
-            {"Metric": "Placebo Forecast Error — worst case (P95)", "key": "p95_placebo_smape"},
-        ]
-        show_test_impact = (mode == "Evaluate" and test_start is not None)
-        if show_test_impact:
-            comparison_rows += [
-                {"Metric": "G. OBSERVED UPLIFT VS PLACEBOS", "is_section": True},
-                {"Metric": "Observed Uplift Percentile vs Placebos", "key": "placebo_percentile_rank"},
-                {"Metric": "Observed Uplift p-value", "key": "placebo_p_two_sided"},
-                {"Metric": "Observed Uplift z-score", "key": "placebo_z_score"},
-                {"Metric": "H. TEST IMPACT", "is_section": True},
-                {"Metric": "Observed Uplift", "key": "observed_uplift"},
-                {"Metric": "Observed Uplift (%)", "key": "observed_uplift_pct"},
-                {"Metric": "Test Period Actual (total)", "key": "test_period_actual"},
-                {"Metric": "Test Period Counterfactual (total)", "key": "test_period_counterfactual"},
-            ]
-
-        def _fmt_pct(v, decimals=1):
-            if v is None or (isinstance(v, float) and np.isnan(v)):
-                return "N/A"
-            return f"{v:.{decimals}f}%"
-
-        def _fmt_num(v, decimals=1):
-            if v is None or (isinstance(v, float) and np.isnan(v)):
-                return "N/A"
-            return f"{v:.{decimals}f}"
-
-        def get_value(key, res, method_name):
-            if key == "control_pool_size":
-                if method_name in [METHOD_STRUCTURAL, METHOD_USER_SELECTED]:
-                    return str(len(control_regions_val))
-                else:
-                    return str(res['n_candidates'])
-            elif key == "controls_selected":
-                if method_name in [METHOD_STRUCTURAL, METHOD_USER_SELECTED]:
-                    return str(len(control_regions_val))
-                else:
-                    return str(res['n_selected'])
-            elif key == "n_selected_features":
-                v = res.get("n_selected_features", None)
-                return str(v) if v is not None else "N/A"
-            elif key == "validation_method_label":
-                return res.get("validation_method_label", "⚪ Insufficient validation history")
-            elif key == "pre_corr":
-                return _fmt_num(res.get('corr', np.nan), decimals=3)
-            elif key == "pre_r2":
-                return _fmt_num(res.get('r2', np.nan), decimals=3)
-            elif key == "pre_smape":
-                return _fmt_pct(res.get('smape', np.nan))
-            elif key == "pre_rmse":
-                return _fmt_num(res.get('rmse', np.nan))
-            elif key == "dw_stat":
-                dw = res.get("dw_stat", np.nan)
-                if dw is None or (isinstance(dw, float) and np.isnan(dw)):
-                    return "N/A"
-                return f"{dw:.2f}"
-            elif key == "autocorrelation_risk":
-                return res.get("autocorrelation_risk", "⚪ Insufficient data")
-            elif key == "holdout_smape":
-                return _fmt_pct(res.get('holdout_smape_mean', np.nan))
-            elif key == "rolling_validation_error_risk":
-                return res.get("rolling_validation_error_risk", "⚪ Insufficient data")
-            elif key == "holdout_rmse":
-                return _fmt_num(res.get('holdout_rmse_mean', np.nan))
-            elif key == "rolling_smape_p90":
-                return _fmt_pct(res.get("rolling_smape_p90", np.nan))
-            elif key == "rolling_bias_pct_mean":
-                return _fmt_pct(res.get("rolling_bias_pct_mean", np.nan))
-            elif key == "rolling_bias_risk":
-                return res.get("rolling_bias_risk", "⚪ Insufficient data")
-            elif key == "overfit_gap_smape":
-                v = res.get("overfit_gap_smape", np.nan)
-                return f"{v:.1f} pp" if not (v is None or (isinstance(v, float) and np.isnan(v))) else "N/A"
-            elif key == "overfit_gap_rmse":
-                return _fmt_num(res.get("overfit_gap_rmse", np.nan))
-            elif key == "overfitting_risk":
-                return res.get("overfitting_risk", "⚪ Insufficient data")
-            elif key == "reliability_drivers":
-                return res.get("reliability_drivers", "⚪ Insufficient data: rolling validation unavailable")
-            elif key == "counterfactual_reliability":
-                reliability = res.get("counterfactual_reliability", None)
-                return RELIABILITY_LABELS.get(reliability, "N/A")
-            elif key == "placebo_windows":
-                return str(len(res['placebos']))
-            elif key == "median_placebo_uplift_pct":
-                return _fmt_pct(res.get('median_placebo_uplift_pct', np.nan))
-            elif key == "placebo_range_pct":
-                return format_range(res.get('placebo_range_lower_pct', np.nan), res.get('placebo_range_upper_pct', np.nan), suffix="%", decimals=1)
-            elif key == "median_placebo_smape":
-                return _fmt_pct(res.get('median_placebo_smape', np.nan))
-            elif key == "p95_placebo_smape":
-                return _fmt_pct(res.get('p95_placebo_smape', np.nan))
-            elif key == "placebo_percentile_rank":
-                return _fmt_pct(res.get('placebo_percentile_rank', np.nan))
-            elif key == "placebo_p_two_sided":
-                return _fmt_num(res.get('placebo_p_value_two_sided', np.nan), decimals=3)
-            elif key == "placebo_z_score":
-                return _fmt_num(res.get('placebo_z_score', np.nan), decimals=2)
-            elif key == "observed_uplift":
-                return _fmt_num(res.get('uplift', np.nan))
-            elif key == "observed_uplift_pct":
-                return _fmt_pct(res.get('uplift_pct', np.nan))
-            elif key == "test_period_actual":
-                y_test_actual = res.get('y_test_actual', None)
-                if y_test_actual is None or len(y_test_actual) == 0:
-                    return "N/A"
-                return _fmt_num(float(np.sum(y_test_actual)))
-            elif key == "test_period_counterfactual":
-                y_pred_test = res.get('y_pred_test', None)
-                if y_pred_test is None or len(y_pred_test) == 0:
-                    return "N/A"
-                return _fmt_num(float(np.sum(y_pred_test)))
-            else:
-                return "N/A"
-
-        table_data = []
-        method_names = list(results.keys())
-        for row in comparison_rows:
-            if row.get("is_section", False):
-                new_row = {"Metric": row["Metric"]}
-                for m in method_names:
-                    new_row[m] = ""
-                table_data.append(new_row)
-            else:
-                new_row = {"Metric": row["Metric"]}
-                for m in method_names:
-                    new_row[m] = get_value(row["key"], results[m], m)
-                table_data.append(new_row)
-
-        comp_df_val = pd.DataFrame(table_data)
-        def style_section_rows(row):
-            if row["Metric"] in [r["Metric"] for r in comparison_rows if r.get("is_section", False)]:
-                return ["font-weight: bold; background-color: #f0f2f6"] * len(row)
-            return [""] * len(row)
-        styled_comp = comp_df_val.style.apply(style_section_rows, axis=1)
-        st.dataframe(styled_comp, width='stretch', hide_index=False)
-
-        st.caption(
-            "Durbin-Watson checks whether residuals are autocorrelated. Values near 2 are good. Values far "
-            "below or above 2 suggest the model is missing time patterns."
-        )
-        st.caption(
-            "**Overfitting Gap** compares the model's in-sample pre-period error with its held-out rolling "
-            "validation error. A large positive gap means the model looks good on the data it was fitted on, "
-            "but performs worse when predicting unseen historical periods."
-        )
-        st.caption(
-            "**Rolling Validation Error** shows whether the model can predict held-out historical periods. "
-            "Lower is better."
-        )
-        st.caption(
-            "**Rolling Bias** checks whether the model systematically over- or under-predicts in held-out "
-            "historical periods."
-        )
-        st.caption(
-            "**Counterfactual Reliability** is the overall traffic-light summary. It takes the worst result "
-            "from the main validation checks: rolling validation error, overfitting gap, rolling bias, and "
-            "residual autocorrelation. **Reliability Drivers** explains which check(s) drove the rating. "
-            "Traffic-light bands are interpretation aids based on validation diagnostics — they are not "
-            "standalone hypothesis tests."
-        )
-        st.caption(
-            "⚪ **Insufficient data** means there were not enough rolling-origin validation windows to assess "
-            "whether the model generalises out-of-sample. Treat this with caution, especially for "
-            "completed-test evaluation."
-        )
-        st.caption(
-            "Placebo uplift ranges are based on historical fake-test windows. They show how much apparent "
-            "uplift could occur when no real intervention happened. If the observed test uplift sits inside "
-            "this range, it may not be distinguishable from normal historical noise. Placebo testing is a "
-            "separate robustness check and is not folded into Counterfactual Reliability."
-        )
-
-        # ---- Interpretation help ----
-        with st.expander("How to interpret these results", expanded=False):
-            if mode == "Design":
-                st.markdown(f"""
-**Validate Test Design — How to read this**
-
-The goal here is to assess whether your control group can reliably predict what would have happened to your test regions without any intervention. If it can, you can have more confidence in a future uplift estimate.
-
----
-
-**Step 1 — Start with Rolling-Origin Validation**
-
-This checks whether the model can predict held-out historical periods using only earlier data. It is the main evidence that the counterfactual model generalises, and is far more trustworthy than pre-period fit alone.
-
-- **Rolling-Origin sMAPE (%)** — Typical percentage error when predicting the test KPI from controls. Aim for below 10%. Above 20% suggests the control group is a poor predictor.
-- **Rolling-Origin sMAPE — Worst Case (P90)** — The error in the weakest 10% of forecast windows. Even if the average looks fine, a high P90 means the model breaks down in certain periods.
-- **Rolling-Origin Bias (%)** — Whether the model consistently overshoots or undershoots. Anything beyond ±5% is a warning sign: the counterfactual will be structurally biased even if sMAPE looks acceptable.
-
----
-
-**Step 2 — Check Overfitting / Reliability Checks**
-
-A method can look excellent in-sample and still be unreliable if it's fitting coincidental historical patterns rather than a genuine relationship.
-
-- **Overfitting Gap, sMAPE percentage points** — Compares the model's in-sample pre-period error with its held-out rolling validation error. A large positive gap (roughly above 3–8 percentage points) means the model looks good on the data it was fitted on, but performs worse when predicting unseen historical periods. This is a validation diagnostic, not a formal statistical test.
-- **Overfitting Risk** — A short traffic-light rating based only on the Overfitting Gap: does the model look meaningfully worse on held-out historical validation than on the fitted pre-period?
-- **Durbin-Watson** / **Autocorrelation Risk** — Durbin-Watson is an established statistic for first-order residual autocorrelation. Values near 2 suggest little autocorrelation; values materially below or above 2 suggest the model is missing time patterns. The traffic-light label is an interpretation band, not a formal critical-value test.
-- **Counterfactual Reliability** — The overall traffic-light summary. It takes the worst result from the main validation checks: Rolling Validation Error, Overfitting Risk, Rolling Bias Risk, and Autocorrelation Risk. **Reliability Drivers** explains which check(s) drove the rating. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess this — this is a data-availability gap, not evidence that reliability is strong.
-
-**How to read the reliability checks**
-
-1. **Rolling Validation Error** checks whether the model predicts held-out historical periods accurately.
-2. **Overfitting Risk** checks whether the model performs much worse on held-out periods than it does on the fitted pre-period.
-3. **Rolling Bias Risk** checks whether the model systematically over- or under-predicts.
-4. **Autocorrelation Risk** checks whether residuals still contain time patterns.
-5. **Counterfactual Reliability** takes the worst of these checks as the overall rating.
-
-Traffic-light bands are interpretation aids based on validation diagnostics. They are not standalone hypothesis tests.
-
----
-
-**Step 3 — Review Placebo Testing**
-
-Placebo tests simulate running a fake intervention across all available historical windows. A well-behaved model produces placebo uplifts clustered near zero.
-
-- **Median Placebo Uplift** — Should be close to 0%. Large values mean the model consistently finds phantom effects.
-- **95% Placebo Uplift Range** — The full spread of placebo (fake-test) uplifts. **This is your rough minimum detectable effect:** if your target uplift is smaller than this range, the design may lack power to distinguish a real signal from historical noise. A wide range also means the model is volatile — your real test uplift will need to sit clearly outside it to be credible.
-
----
-
-**Step 4 — Use Pre-Period Fit as a sanity check only**
-
-Pre-period Correlation is shown for reference but can be misleadingly high — a model can fit the pre-period well and still fail out-of-sample. Always weight the rolling-origin metrics more heavily.
-
-**Durbin-Watson** is an established statistic for first-order residual autocorrelation in the model's pre-period residuals. It is around 2.0 when residuals have little autocorrelation; values below 2 suggest positive autocorrelation, values above 2 suggest negative autocorrelation. Strong autocorrelation is a sign the model is missing structure in the data (e.g. trends or delayed effects) that the standard errors don't account for.
-
----
-
-**Rule of thumb:** Low rolling-origin sMAPE + Strong/Caution Counterfactual Reliability + a narrow, tight placebo distribution = a reliable test design ready to run.
-                """)
-            else:
-                st.markdown("""
-**Measure Test Impact — How to read this**
-
-Before trusting the uplift estimate, verify the model can reliably predict the test KPI. An unreliable model produces an unreliable uplift number.
-
----
-
-**Step 1 — Verify the model is trustworthy**
-
-Start with Rolling-Origin Validation. This checks whether the model can predict held-out historical periods using only earlier data. It is the main evidence that the counterfactual model generalises.
-
-- **Rolling-Origin sMAPE (%)** — Typical out-of-sample prediction error. If this is above 15–20%, treat the uplift estimate with caution — the counterfactual baseline is uncertain.
-- **Rolling-Origin Bias (%)** — Persistent bias in the model's predictions. A model that consistently undershoots will overstate uplift, and vice versa.
-- **Counterfactual Reliability** — The overall traffic-light summary. It takes the worst result from the main validation checks: Rolling Validation Error, Overfitting Risk, Rolling Bias Risk, and Autocorrelation Risk. **Reliability Drivers** explains which check(s) drove the rating. If this is "Weak", treat the uplift number with extra caution, particularly for data-optimised methods. If it shows "Insufficient data", there wasn't enough rolling-origin history to assess this at all — treat the uplift with the same caution you would give a "Weak" result. The traffic-light label is an interpretation aid, not a formal statistical test.
-- **95% Placebo Uplift Range** — The range of apparent uplifts the model detects in historical periods with no intervention. Your observed uplift needs to sit clearly outside this range.
-
-**How to read the reliability checks**
-
-1. **Rolling Validation Error** checks whether the model predicts held-out historical periods accurately.
-2. **Overfitting Risk** checks whether the model performs much worse on held-out periods than it does on the fitted pre-period.
-3. **Rolling Bias Risk** checks whether the model systematically over- or under-predicts.
-4. **Autocorrelation Risk** checks whether residuals still contain time patterns.
-5. **Counterfactual Reliability** takes the worst of these checks as the overall rating.
-
-Traffic-light bands are interpretation aids based on validation diagnostics. They are not standalone hypothesis tests.
-
----
-
-**Step 2 — Assess the uplift result**
-
-- **Observed Uplift Percentile vs Placebos** — Where your observed uplift ranks relative to the distribution of historical placebo (fake-test) uplifts. 95th percentile or above is stronger evidence that the observed uplift is unusual relative to pre-period noise.
-- **Observed Uplift p-value** — The placebo p-value is an empirical extremeness check: it shows how unusual the observed uplift is relative to historical fake-test windows. It is not proof of causality and should be interpreted alongside model fit, rolling-origin validation, and business context. Below 0.05 is the conventional (approximate) threshold analysts use as a rule of thumb.
-
----
-
-**Step 3 — Compare methods**
-
-If you ran multiple methods (Structural, Data-Optimised), look for agreement. When both methods produce similar uplift estimates, both show good out-of-sample fit, and both show Strong/Caution Counterfactual Reliability, confidence in the result is higher.
-
----
-
-**Rule of thumb:** Low rolling-origin sMAPE + Strong/Caution Counterfactual Reliability + observed uplift outside the placebo range + a small p-value = a result with stronger evidence behind it, though still not proof of causality on its own.
-                """)
+        # ---- Method Comparison table (traffic-light diagnostics), captions, and
+        # interpretation help — rendered by a standalone, independently testable function. ----
+        render_method_comparison_table(results, mode, test_start, control_regions_val)
 
 
 with tab2:
