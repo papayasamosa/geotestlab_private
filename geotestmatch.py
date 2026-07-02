@@ -3145,10 +3145,12 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         {"Metric": "Pre-Period sMAPE (%)", "key": "pre_smape"},
         {"Metric": "Pre-Period RMSE", "key": "pre_rmse"},
 
-        {"Metric": "C. ROLLING-ORIGIN VALIDATION", "is_section": True},
+        {"Metric": "C1. ROLLING-ORIGIN VALIDATION - ERROR", "is_section": True},
         {"Metric": "Validation sMAPE (%)", "key": "holdout_smape"},
         {"Metric": "Validation RMSE", "key": "holdout_rmse"},
         {"Metric": "Validation Error Risk", "key": "rolling_validation_error_risk"},
+        
+        {"Metric": "C2. ROLLING-ORIGIN VALIDATION - BIAS", "is_section": True},
         {"Metric": "Average Bias (%)", "key": "rolling_bias_pct_mean"},
         {"Metric": "Bias Risk", "key": "rolling_bias_risk"},
 
