@@ -76,7 +76,19 @@ METHOD_USER_SELECTED = "User Selected Test and Control"
 
 def load_and_reshape_kpi(uploaded_file):
     """Load KPI Excel, melt to long format, keep missing values as NaN."""
-    df_raw = pd.read_excel(uploaded_file, engine="calamine", header=0)
+    try:
+        df_raw = pd.read_excel(uploaded_file, engine="calamine", header=0)
+    except Exception:
+        try:
+            uploaded_file.seek(0)
+            df_raw = pd.read_excel(uploaded_file, engine="openpyxl", header=0)
+        except Exception as e:
+            st.error(
+                "The KPI file could not be read with either the calamine or openpyxl engine. "
+                "Please confirm this is a valid .xlsx file and try again. "
+                f"(Details: {e})"
+            )
+            st.stop()
     region_col = df_raw.columns[0]
     metric_col = df_raw.columns[1]
     df_long = df_raw.melt(id_vars=[region_col, metric_col], var_name="date", value_name="kpi")
@@ -108,10 +120,40 @@ def apply_geo_aggregation(df_long, geo_col):
     return agg_df
 
 def build_model_matrix(agg_df, control_list, test_regions):
+    """
+    Build the model matrix (test KPI + one column per control) for a given control list.
+
+    Returns (model, matrix_diagnostics). matrix_diagnostics reports how many rows were
+    lost to the dropna() step (e.g. because a selected control had missing KPI values for
+    some dates) so callers can warn the user rather than silently losing data. Diagnostics
+    are computed after the merge but before dropna().
+
+    NOTE: this changed from returning `model` alone to returning `(model, matrix_diagnostics)`.
+    All callers in this file have been updated accordingly.
+    """
     test_agg = agg_df[agg_df["region"].isin(test_regions)].groupby("date")["kpi"].sum().reset_index().rename(columns={"kpi": "test_kpi"})
     control_wide = agg_df[agg_df["region"].isin(control_list)].pivot(index="date", columns="region", values="kpi").reset_index()
-    model = test_agg.merge(control_wide, on="date", how="inner").sort_values("date").dropna().reset_index(drop=True)
-    return model
+    merged = test_agg.merge(control_wide, on="date", how="inner").sort_values("date").reset_index(drop=True)
+
+    rows_before_dropna = len(merged)
+    # Which control columns actually have missing values (only meaningful control columns,
+    # not "date"/"test_kpi").
+    control_cols_present = [c for c in control_list if c in merged.columns]
+    control_columns_with_missing = [c for c in control_cols_present if merged[c].isna().any()]
+
+    model = merged.dropna().reset_index(drop=True)
+    rows_after_dropna = len(model)
+    rows_dropped = rows_before_dropna - rows_after_dropna
+    pct_rows_dropped = (rows_dropped / rows_before_dropna * 100.0) if rows_before_dropna > 0 else 0.0
+
+    matrix_diagnostics = {
+        "rows_before_dropna": rows_before_dropna,
+        "rows_after_dropna": rows_after_dropna,
+        "rows_dropped": rows_dropped,
+        "pct_rows_dropped": pct_rows_dropped,
+        "control_columns_with_missing": control_columns_with_missing,
+    }
+    return model, matrix_diagnostics
 
 def add_lagged_control_features(model_df, control_list, lags=(1,), frequency_config=None, time_series_frequency=None):
     """
@@ -222,6 +264,40 @@ def durbin_watson_stat(residuals):
         return np.nan
     return np.sum(np.diff(residuals) ** 2) / denom
 
+def classify_autocorrelation_risk(dw_stat):
+    """
+    Classify residual autocorrelation risk from the Durbin-Watson statistic.
+
+    Durbin-Watson is approximately:
+    - 2.0 = little/no first-order autocorrelation
+    - below 2.0 = positive autocorrelation
+    - above 2.0 = negative autocorrelation
+
+    For this app, positive autocorrelation is the main concern because it can make
+    the model look more reliable than it is by leaving time-patterned residuals.
+    """
+    if dw_stat is None:
+        return "Insufficient data"
+
+    try:
+        if pd.isna(dw_stat) or not np.isfinite(float(dw_stat)):
+            return "Insufficient data"
+    except Exception:
+        return "Insufficient data"
+
+    dw = float(dw_stat)
+
+    if 1.7 <= dw <= 2.3:
+        return "🟢 Low autocorrelation"
+    elif 1.3 <= dw < 1.7:
+        return "🟠 Positive autocorrelation"
+    elif dw < 1.3:
+        return "🔴 High positive autocorrelation"
+    elif 2.3 < dw <= 2.7:
+        return "🟠 Negative autocorrelation"
+    else:
+        return "🔴 High negative autocorrelation"
+
 def calculate_overfit_gap(pre_smape, rolling_smape):
     """
     Overfit gap: how much worse the model performs out-of-sample (rolling-origin)
@@ -266,31 +342,47 @@ def calculate_feature_density(n_selected_features, n_pre_periods):
         return np.nan
     return n_selected_features / n_pre_periods
 
-def classify_overfitting_risk(overfit_gap_smape, feature_density, rolling_bias_pct=None):
+def classify_overfitting_risk(overfit_gap_smape, feature_density, rolling_bias_pct=None, rolling_smape_mean=None):
     """
-    Classifies overfitting risk as "Low", "Moderate", "High", or "Insufficient data"
-    from the overfit gap (out-of-sample minus in-sample sMAPE), the feature density
-    (selected features per pre-period period — week or day, depending on frequency),
-    and optionally the rolling-origin bias.
+    Classifies "Overfitting / Reliability Risk" as "Low", "Moderate", "High", or
+    "Insufficient data".
 
-    The overfit gap (which depends on rolling-origin validation actually having run)
-    is the stronger signal here — a low feature density alone only means the model
-    isn't obviously too complex for the data, it does NOT confirm the model
-    generalises out-of-sample. So:
+    This is a broader model-reliability diagnostic, not just an overfitting check.
+    A small overfit gap (in-sample vs out-of-sample sMAPE) only tells you the model
+    is *consistent* between pre-period fit and rolling-origin validation — it does NOT
+    tell you the model is *accurate*. A model can have a small gap while still being a
+    poor predictor overall (high pre-period sMAPE AND high rolling-origin sMAPE). That
+    case should not be reported as "Low" risk just because the gap is small, so this
+    function also considers the absolute level of rolling-origin validation error
+    (rolling_smape_mean), alongside the overfit gap, feature density, and rolling bias.
 
-    - If neither overfit_gap_smape nor feature_density is usable, returns
-      "Insufficient data" — there isn't enough evidence to call the risk anything else.
-    - If overfit_gap_smape is missing (rolling-origin validation didn't produce a
-      usable result) and feature_density is low (<= 0.30), also returns
-      "Insufficient data" rather than "Low" — we haven't actually checked whether the
-      model holds up out-of-sample, so "Low" would overstate confidence.
-    - If overfit_gap_smape is missing but feature_density is meaningfully high
-      (> 0.30), classify risk from feature density alone ("Moderate" above 0.30,
-      "High" above 0.50) — a high feature density is still informative even without
-      rolling-origin validation.
-    - If overfit_gap_smape is available, the full rule set (overfit gap, feature
-      density, and optionally rolling bias) applies as before, and "Low" is a valid
-      outcome.
+    Inputs:
+    - overfit_gap_smape: rolling-origin sMAPE minus pre-period sMAPE (percentage points).
+      A large positive gap signals classic overfitting (looks good in-sample, worse
+      out-of-sample).
+    - feature_density: selected model features per pre-period period (week/day).
+      A high density means little historical data per model parameter.
+    - rolling_bias_pct: optional rolling-origin bias (%). Large absolute bias increases
+      risk by one level.
+    - rolling_smape_mean: optional absolute rolling-origin sMAPE (%). High absolute
+      out-of-sample error increases risk even when the gap itself is small, because it
+      means the model is not predicting the test group accurately regardless of whether
+      it is "overfit" in the narrow sense.
+
+    - If none of overfit_gap_smape, feature_density, or rolling_smape_mean is usable,
+      returns "Insufficient data" — there isn't enough evidence to call the risk
+      anything else.
+    - If overfit_gap_smape and rolling_smape_mean are both missing (rolling-origin
+      validation didn't produce a usable result) and feature_density is low (<= 0.30),
+      also returns "Insufficient data" rather than "Low" — we haven't actually checked
+      whether the model holds up out-of-sample, so "Low" would overstate confidence.
+    - If overfit_gap_smape / rolling_smape_mean are missing but feature_density is
+      meaningfully high (> 0.30), classify risk from feature density alone ("Moderate"
+      above 0.30, "High" above 0.50) — a high feature density is still informative even
+      without rolling-origin validation.
+    - Otherwise, the full rule set (overfit gap, absolute rolling-origin sMAPE, feature
+      density, and optionally rolling bias) applies, and "Low" is a valid outcome only
+      when none of these signals indicate elevated risk.
 
     Missing (np.nan / None / pd.NA / +-inf) inputs are handled gracefully via
     _is_valid() — an invalid input simply does not contribute evidence of risk
@@ -316,16 +408,17 @@ def classify_overfitting_risk(overfit_gap_smape, feature_density, rolling_bias_p
     gap_valid = _is_valid(overfit_gap_smape)
     density_valid = _is_valid(feature_density)
     bias_valid = _is_valid(rolling_bias_pct)
+    smape_valid = _is_valid(rolling_smape_mean)
 
     # Not enough evidence to classify at all.
-    if not gap_valid and not density_valid:
+    if not gap_valid and not density_valid and not smape_valid:
         return "Insufficient data"
 
-    # Rolling-origin validation didn't produce a usable overfit gap — the stronger
-    # out-of-sample check simply hasn't run. Only fall back to feature-density-only
-    # classification when density is high enough to be informative on its own;
-    # otherwise we genuinely don't know, so don't call it "Low".
-    if not gap_valid:
+    # Rolling-origin validation didn't produce a usable gap or absolute error — the
+    # stronger out-of-sample checks simply haven't run. Only fall back to
+    # feature-density-only classification when density is high enough to be
+    # informative on its own; otherwise we genuinely don't know, so don't call it "Low".
+    if not gap_valid and not smape_valid:
         if feature_density > 0.50:
             return "High"
         elif feature_density > 0.30:
@@ -333,16 +426,26 @@ def classify_overfitting_risk(overfit_gap_smape, feature_density, rolling_bias_p
         else:
             return "Insufficient data"
 
-    # overfit_gap_smape is available — apply the full rule set.
+    # At least one of overfit_gap_smape / rolling_smape_mean is available — apply the
+    # full rule set.
     risk_idx = 0  # start at "Low"
 
     def _bump(idx, to_idx):
         return max(idx, to_idx)
 
-    if overfit_gap_smape > 8:
-        risk_idx = _bump(risk_idx, 2)  # High
-    elif overfit_gap_smape > 3:
-        risk_idx = _bump(risk_idx, 1)  # Moderate
+    if gap_valid:
+        if overfit_gap_smape > 8:
+            risk_idx = _bump(risk_idx, 2)  # High
+        elif overfit_gap_smape > 3:
+            risk_idx = _bump(risk_idx, 1)  # Moderate
+
+    # Absolute rolling-origin validation error: catches the "generally poor model"
+    # case where pre-period and rolling sMAPE are both high but the gap is small.
+    if smape_valid:
+        if rolling_smape_mean > 30:
+            risk_idx = _bump(risk_idx, 2)  # High
+        elif rolling_smape_mean > 20:
+            risk_idx = _bump(risk_idx, 1)  # Moderate
 
     if density_valid:
         if feature_density > 0.50:
@@ -843,7 +946,27 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     combined_end = max(combined_end_candidates)
 
     full_mask = (agg_df["date"] >= pre_start) & (agg_df["date"] <= combined_end)
-    model_full = build_model_matrix(agg_df[full_mask], control_list, test_regions)
+    model_full, matrix_diagnostics = build_model_matrix(agg_df[full_mask], control_list, test_regions)
+
+    # ---- Row-loss diagnostics: warn when a meaningful share of rows were dropped because
+    # the test series or a selected control had missing KPI values for some dates. ----
+    _pct_dropped = matrix_diagnostics.get("pct_rows_dropped", 0.0)
+    _rows_dropped = matrix_diagnostics.get("rows_dropped", 0)
+    _rows_before = matrix_diagnostics.get("rows_before_dropna", 0)
+    if _rows_dropped > 0 and _pct_dropped > 20:
+        st.error(
+            f"{_rows_dropped} of {_rows_before} rows ({_pct_dropped:.1f}%) were removed because "
+            "the test series or at least one selected control had missing KPI values. "
+            "This is a large share of the data and the validation result may be unreliable. "
+            f"Controls with missing values: {', '.join(matrix_diagnostics.get('control_columns_with_missing', [])) or 'none'}."
+        )
+    elif _rows_dropped > 0 and _pct_dropped > 10:
+        st.warning(
+            f"{_rows_dropped} of {_rows_before} rows ({_pct_dropped:.1f}%) were removed because "
+            "the test series or at least one selected control had missing KPI values. "
+            "This can affect validation reliability. "
+            f"Controls with missing values: {', '.join(matrix_diagnostics.get('control_columns_with_missing', [])) or 'none'}."
+        )
 
     if include_lagged_controls:
         model_full, model_feature_cols, lagged_feature_map, lag_drop_metadata = add_lagged_control_features(
@@ -1117,7 +1240,10 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     # not just the count of selected base regions. ----
     n_selected_features = len(selected_features)
     feature_density = calculate_feature_density(n_selected_features, n_pre_periods)
-    overfitting_risk = classify_overfitting_risk(overfit_gap_smape, feature_density, rolling_bias_pct_mean)
+    overfitting_risk = classify_overfitting_risk(
+        overfit_gap_smape, feature_density, rolling_bias_pct_mean, rolling_smape_mean
+    )
+    autocorrelation_risk = classify_autocorrelation_risk(dw_stat)
 
     return {
         "dates_pre": dates_pre,
@@ -1128,6 +1254,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         "smape": s,
         "rmse": rmse,
         "dw_stat": dw_stat,
+        "autocorrelation_risk": autocorrelation_risk,
         "pre_residuals": pre_residuals,
         "holdout_smape_mean": holdout_smape_mean,
         "holdout_rmse_mean": holdout_rmse_mean,
@@ -1155,6 +1282,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         "lag_periods": lag_periods,
         "lag_label": frequency_config["lag_label"],
         "lag_drop_metadata": lag_drop_metadata,
+        "matrix_diagnostics": matrix_diagnostics,
         "placebo_length_periods": placebo_len,
         "uplift": uplift,
         "uplift_pct": uplift_pct,
@@ -2916,25 +3044,44 @@ def render_time_series_validation(mode: str):
         )
 
     # Frequency inference uses the SELECTED METRIC's own dates (not the whole file), since
-    # different metrics can have different date coverage.
+    # different metrics can have different date coverage. A confirmed daily-vs-weekly
+    # mismatch is treated as a hard blocker (not just a soft suggestion) because it can
+    # silently change how lags behave and make results misleading — see the checkbox below.
     _inferred_freq = infer_time_series_frequency(_metric_dates_all)
-    if _inferred_freq != "unknown" and _inferred_freq != time_series_frequency:
-        if _inferred_freq == "daily" and time_series_frequency == "weekly":
-            st.warning(
-                "⚠️ The uploaded dates look daily, but Weekly is selected. Either switch to Daily or "
-                "upload weekly-aggregated data."
-            )
-        elif _inferred_freq == "weekly" and time_series_frequency == "daily":
-            st.warning(
-                "⚠️ The uploaded dates look weekly, but Daily is selected. Daily analysis expects daily "
-                "observations."
-            )
-        else:
-            st.warning(
-                f"⚠️ The uploaded data looks like it may be **{_inferred_freq}** data (based on the typical "
-                f"gap between dates), but **{'Weekly' if time_series_frequency == 'weekly' else 'Daily'}** "
-                f"is currently selected. Double‑check your selection — this is a suggestion, not a hard rule."
-            )
+    frequency_mismatch_detected = False
+    if _inferred_freq == "daily" and time_series_frequency == "weekly":
+        frequency_mismatch_detected = True
+        st.error(
+            "The uploaded KPI dates look daily, but weekly mode is selected. "
+            "Weekly mode expects already weekly-aggregated data and does not aggregate daily rows automatically. "
+            "In this mode, a 1-week lag is implemented as a 1-row lag, which would behave like a 1-day lag on daily data."
+        )
+    elif _inferred_freq == "weekly" and time_series_frequency == "daily":
+        frequency_mismatch_detected = True
+        st.error(
+            "The uploaded KPI dates look weekly, but daily mode is selected. "
+            "Daily mode expects daily rows and uses a true calendar 7-day lag. "
+            "Please switch to weekly mode unless the file genuinely contains daily data."
+        )
+    elif _inferred_freq != "unknown" and _inferred_freq != time_series_frequency:
+        # Covers any other inferred/selected mismatch not caught by the two explicit cases above.
+        frequency_mismatch_detected = True
+        st.error(
+            f"The uploaded data looks like it may be **{_inferred_freq}** data (based on the typical "
+            f"gap between dates), but **{'Weekly' if time_series_frequency == 'weekly' else 'Daily'}** "
+            f"is currently selected. This mismatch can make lag behaviour and validation results misleading."
+        )
+
+    frequency_mismatch_acknowledged = True
+    if frequency_mismatch_detected:
+        frequency_mismatch_acknowledged = st.checkbox(
+            "I understand the frequency mismatch and want to continue",
+            value=False,
+            key=f"{mode_prefix}_frequency_mismatch_ack",
+        )
+        if not frequency_mismatch_acknowledged:
+            st.info("Validation and Bayesian TBR are disabled until the frequency mismatch above is acknowledged or resolved.")
+    st.session_state.frequency_mismatch_blocked = frequency_mismatch_detected and not frequency_mismatch_acknowledged
 
     # -------------------------------------------------------------------------
     # 2. Analysis Type header (static — driven by the tab the user is in)
@@ -3290,13 +3437,21 @@ def render_time_series_validation(mode: str):
     # 5. Run button
     # -------------------------------------------------------------------------
     run_label = "Assess Region Alignment" if mode == "Design" else "Evaluate Test Impact"
+    _freq_mismatch_blocked = st.session_state.get("frequency_mismatch_blocked", False)
+    _run_disabled = insufficient_pre_period or _freq_mismatch_blocked
+    if _freq_mismatch_blocked:
+        _run_help = "Resolve or acknowledge the frequency mismatch warning above before running."
+    elif insufficient_pre_period:
+        _run_help = "Resolve the pre-period data warning above before running."
+    else:
+        _run_help = None
     validate_clicked = st.button(
         run_label,
         width='stretch',
         type="primary",
         key=f"{mode_prefix}_run_button",
-        disabled=insufficient_pre_period,
-        help="Resolve the pre-period data warning above before running." if insufficient_pre_period else None
+        disabled=_run_disabled,
+        help=_run_help
     )
 
     if validate_clicked:
@@ -3308,6 +3463,10 @@ def render_time_series_validation(mode: str):
     if st.session_state.validation_triggered:
         if uploaded_file is None or st.session_state.kpi_long_df is None:
             st.error("KPI file not available. Please upload a file first.")
+            st.session_state.validation_triggered = False
+            st.stop()
+        if st.session_state.get("frequency_mismatch_blocked", False):
+            st.error("Validation cannot run while there is an unacknowledged frequency mismatch. Please resolve or acknowledge it above.")
             st.session_state.validation_triggered = False
             st.stop()
 
@@ -3626,6 +3785,12 @@ def render_time_series_validation(mode: str):
         # ---- Display per‑method results ----
         for method_name, res in results.items():
             st.markdown(f"#### {method_name}")
+            if method_name == METHOD_STRUCTURAL:
+                st.caption(
+                    "Structurally Matched Controls uses the GeoMatch-selected control pool, then fits an "
+                    "Elastic Net model to estimate the counterfactual. Some structurally selected controls "
+                    "may be shrunk to zero by the model."
+                )
 
             with st.expander("Control Selection Details", expanded=False):
                 if method_name in [METHOD_STRUCTURAL, METHOD_USER_SELECTED]:
@@ -3658,6 +3823,38 @@ def render_time_series_validation(mode: str):
                         f"{_lag_drop_meta['rows_dropped_due_to_lag']} of {_lag_drop_meta['rows_before_lag_drop']} rows "
                         f"({_lag_drop_meta['lag_drop_pct']:.1f}%) were dropped because those lag dates were missing. "
                         f"Check whether your daily data has gaps."
+                    )
+
+            # ---- Feature-density / overfitting risk visibility (item 6) ----
+            _fd = res.get("feature_density", np.nan)
+            _n_sel_feat = res.get("n_selected_features", None)
+            _n_pre_per = res.get("n_pre_periods", res.get("n_pre_weeks", None))
+            if _fd is not None and not (isinstance(_fd, float) and np.isnan(_fd)) and _n_sel_feat is not None and _n_pre_per is not None:
+                if _fd > 0.50:
+                    st.error(
+                        f"High overfitting risk: the selected model uses {_n_sel_feat} features across "
+                        f"{_n_pre_per} pre-period observations (feature density = {_fd:.2f}). "
+                        "This means there is little historical data per model feature, so the uplift estimate may be unstable."
+                    )
+                elif _fd > 0.30:
+                    st.warning(
+                        f"Moderate overfitting risk: the selected model uses {_n_sel_feat} features across "
+                        f"{_n_pre_per} pre-period observations (feature density = {_fd:.2f}). "
+                        "Review rolling-origin and placebo diagnostics before trusting the result."
+                    )
+
+            # ---- High validation error, even when the overfit gap is small (item 13) ----
+            _rolling_smape_mean = res.get("rolling_smape_mean", res.get("holdout_smape_mean", np.nan))
+            if _rolling_smape_mean is not None and not (isinstance(_rolling_smape_mean, float) and np.isnan(_rolling_smape_mean)):
+                if _rolling_smape_mean > 30:
+                    st.error(
+                        f"High validation error: rolling-origin sMAPE is {_rolling_smape_mean:.1f}%. "
+                        "Even if the overfit gap is small, the model is not predicting the test group accurately enough to support a reliable uplift estimate."
+                    )
+                elif _rolling_smape_mean > 20:
+                    st.warning(
+                        f"Elevated validation error: rolling-origin sMAPE is {_rolling_smape_mean:.1f}%. "
+                        "Review the fit chart, residual diagnostics, and placebo results before relying on this method."
                     )
 
             col1, col2, col3, col4 = st.columns(4)
@@ -3833,6 +4030,8 @@ def render_time_series_validation(mode: str):
             "Insufficient data": "⚪ Insufficient data",
         }
 
+        FEATURE_DENSITY_LABEL = f"Feature Density (selected features / pre-period {vres_freq_config['period_label_plural']})"
+
         comparison_rows = [
             {"Metric": "A. CONTROL SELECTION", "is_section": True},
             {"Metric": "Control Pool Size", "key": "control_pool_size"},
@@ -3847,20 +4046,21 @@ def render_time_series_validation(mode: str):
 
             {"Metric": "C. RESIDUAL DIAGNOSTICS", "is_section": True},
             {"Metric": "Durbin-Watson", "key": "dw_stat"},
+            {"Metric": "Residual Autocorrelation Risk", "key": "autocorrelation_risk"},
 
             {"Metric": "D. ROLLING-ORIGIN VALIDATION", "is_section": True},
-            {"Metric": "Rolling-Origin sMAPE (%)", "key": "holdout_smape"},
+            {"Metric": "Rolling Validation sMAPE (%)", "key": "holdout_smape"},
             {"Metric": "Rolling-Origin sMAPE — Worst Case (P90)", "key": "rolling_smape_p90"},
             {"Metric": "Rolling-Origin RMSE", "key": "holdout_rmse"},
             {"Metric": "Rolling-Origin Bias (%)", "key": "rolling_bias_pct_mean"},
 
             {"Metric": "E. OVERFITTING DIAGNOSTICS", "is_section": True},
-            {"Metric": "Overfit Gap sMAPE (pp)", "key": "overfit_gap_smape"},
+            {"Metric": "Overfit Gap, sMAPE percentage points", "key": "overfit_gap_smape"},
             {"Metric": "Overfit Gap RMSE", "key": "overfit_gap_rmse"},
-            {"Metric": f"Selected Features / Pre {vres_freq_config['period_label_plural'].capitalize()}", "key": "feature_density"},
-            {"Metric": "Overfitting Risk", "key": "overfitting_risk"},
+            {"Metric": FEATURE_DENSITY_LABEL, "key": "feature_density"},
+            {"Metric": "Overfitting / Reliability Risk", "key": "overfitting_risk"},
 
-            {"Metric": "F. PLACEBO TESTING (historical fake-test windows)", "is_section": True},
+            {"Metric": "F. PLACEBO TESTING", "is_section": True},
             {"Metric": "Placebo Windows Run", "key": "placebo_windows"},
             {"Metric": "Typical Placebo Uplift", "key": "median_placebo_uplift_pct"},
             {"Metric": "Placebo Uplift Range (95%)", "key": "placebo_range_pct"},
@@ -3917,13 +4117,10 @@ def render_time_series_validation(mode: str):
                 dw = res.get("dw_stat", np.nan)
                 if dw is None or (isinstance(dw, float) and np.isnan(dw)):
                     return "N/A"
-                if dw < 1.5:
-                    status = " (possible positive autocorrelation)"
-                elif dw > 2.5:
-                    status = " (possible negative autocorrelation)"
-                else:
-                    status = " (low autocorrelation concern)"
-                return f"{dw:.2f}{status}"
+                return f"{dw:.2f}"
+            elif key == "autocorrelation_risk":
+                risk = res.get("autocorrelation_risk", None)
+                return risk if risk else "N/A"
             elif key == "holdout_smape":
                 return _fmt_pct(res.get('holdout_smape_mean', np.nan))
             elif key == "holdout_rmse":
@@ -4003,10 +4200,22 @@ def render_time_series_validation(mode: str):
         st.dataframe(styled_comp, width='stretch', hide_index=False)
 
         st.caption(
-            "Overfitting risk is higher when a method fits the pre-period very well but performs much worse in "
-            f"rolling-origin validation, or when it uses many selected features relative to the number of "
+            "Durbin-Watson checks whether residuals are time-patterned. Values near 2 suggest little "
+            "autocorrelation. Values materially below 2 suggest positive autocorrelation, meaning the model "
+            "may be missing time structure and uncertainty may be understated."
+        )
+        st.caption(
+            f"**{FEATURE_DENSITY_LABEL}** is the number of selected model features divided by the number of "
+            f"pre-period {vres_freq_config['period_label_plural']}. Higher values mean the model has less "
+            "historical data per feature, which increases the risk of overfitting."
+        )
+        st.caption(
+            "**Overfitting / Reliability Risk** is higher when a method fits the pre-period very well but performs much worse in "
+            f"rolling-origin validation (overfit gap), when the rolling-origin validation error itself is high even if the "
+            f"gap is small, or when it uses many selected features relative to the number of "
             f"pre-period {vres_freq_config['period_label_plural']}. This is especially important for data-optimised "
-            "methods because they search across many possible controls and can find coincidental historical relationships."
+            "methods because they search across many possible controls and can find coincidental historical relationships. "
+            "A small overfit gap is only reassuring if the rolling validation error itself is also acceptable."
         )
         st.caption(
             "⚪ **Insufficient data** means there were not enough rolling-origin validation windows to assess "
@@ -4043,9 +4252,10 @@ These metrics test the model on historical data it has never seen, making them f
 
 A method can look excellent in-sample and still be unreliable if it's fitting coincidental historical patterns rather than a genuine relationship.
 
-- **Overfit Gap sMAPE (pp)** — How much worse the model performs out-of-sample versus in-sample. A large positive gap (roughly above 3–8 percentage points) suggests the pre-period fit is flattering and won't hold up.
-- **Selected Features / Pre {vres_freq_config['period_label_plural'].capitalize()}** — How many model features (including lagged terms) are being fit relative to how many pre-period {vres_freq_config['period_label_plural']} of data are available. A high ratio (above ~0.30–0.50) increases the risk of fitting noise.
-- **Overfitting Risk** — A simple Low / Moderate / High summary combining the above. Treat "High" results with real caution, especially for data-optimised methods. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess overfitting — this is a data-availability gap, not evidence that risk is low.
+- **Overfit Gap, sMAPE percentage points** — How much worse the model performs out-of-sample versus in-sample. A large positive gap (roughly above 3–8 percentage points) suggests the pre-period fit is flattering and won't hold up.
+- **{FEATURE_DENSITY_LABEL}** — How many model features (including lagged terms) are being fit relative to how many pre-period {vres_freq_config['period_label_plural']} of data are available. A high ratio (above ~0.30–0.50) increases the risk of fitting noise.
+- **Residual Autocorrelation Risk** — Interprets the Durbin-Watson statistic on a traffic-light scale. Values near 2 mean low autocorrelation; values materially below 2 flag positive autocorrelation, meaning the model may be missing time structure.
+- **Overfitting / Reliability Risk** — A Low / Moderate / High summary combining the overfit gap, the *absolute* level of rolling-origin validation error (a small gap is not reassuring if rolling-origin sMAPE itself is high), feature density, and rolling bias. Treat "High" results with real caution, especially for data-optimised methods. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess this — this is a data-availability gap, not evidence that risk is low.
 
 ---
 
@@ -4080,7 +4290,7 @@ Before trusting the uplift estimate, verify the model can reliably predict the t
 
 - **Rolling-Origin sMAPE (%)** — Typical out-of-sample prediction error. If this is above 15–20%, treat the uplift estimate with caution — the counterfactual baseline is uncertain.
 - **Rolling-Origin Bias (%)** — Persistent bias in the model's predictions. A model that consistently undershoots will overstate uplift, and vice versa.
-- **Overfitting Risk** — If this is "High", the pre-period fit may be flattering and not representative of genuine predictive ability — treat the uplift number with extra caution, particularly for data-optimised methods. If it shows "Insufficient data", there wasn't enough rolling-origin history to assess overfitting at all — treat the uplift with the same caution you would give a "High" result.
+- **Overfitting / Reliability Risk** — If this is "High", the pre-period fit may be flattering and not representative of genuine predictive ability, or the rolling-origin validation error itself is too high to trust — treat the uplift number with extra caution, particularly for data-optimised methods. If it shows "Insufficient data", there wasn't enough rolling-origin history to assess this at all — treat the uplift with the same caution you would give a "High" result.
 - **Placebo Uplift Range (95%)** — The range of apparent uplifts the model detects in historical periods with no intervention. Your observed uplift needs to sit clearly outside this range.
 
 ---
@@ -4154,14 +4364,29 @@ with tab4:
                 )
                 if selected_bayes_method:
                     res = results.get(selected_bayes_method)
-                    if selected_bayes_method == METHOD_STRUCTURAL:
+                    if selected_bayes_method in (METHOD_STRUCTURAL, METHOD_USER_SELECTED):
+                        # User Selected Test and Control (and the structural pool itself)
+                        # uses the user-selected controls directly, but must not be empty.
                         bayes_control_list = control_regions_val
-                    elif selected_bayes_method == METHOD_USER_SELECTED:
-                        bayes_control_list = control_regions_val
+                        if not bayes_control_list:
+                            st.warning(
+                                "No control regions are selected, so Bayesian TBR cannot be run. "
+                                "Choose another method or select at least one control region."
+                            )
+                            st.stop()
                     else:
+                        # Data-Optimised / LASSO / Elastic Net methods: only use the
+                        # model-selected base control regions. Do NOT fall back to the
+                        # full candidate control pool if the model selected zero controls —
+                        # that would silently change what Bayesian TBR is actually testing.
                         bayes_control_list = res.get("selected_regions", []) if res else []
-                        if not bayes_control_list and res:
-                            bayes_control_list = res.get("control_list", [])
+                        if not bayes_control_list:
+                            st.warning(
+                                "The selected method did not retain any controls, so Bayesian TBR cannot be run for this method. "
+                                "Choose another method, adjust exclusions, increase the control pool, or disable overly "
+                                "restrictive validation settings."
+                            )
+                            st.stop()
 
                     bayes_base_control_list = list(bayes_control_list)
                     # Bayesian TBR always uses the same frequency and lag setup as the selected
@@ -4208,7 +4433,10 @@ with tab4:
                         ),
                     )
 
-                    if st.button("Run Bayesian Time-Based Regression (TBR)", width='stretch', type="primary", key="run_bayes_tab4"):
+                    _bayes_freq_blocked = st.session_state.get("frequency_mismatch_blocked", False)
+                    if _bayes_freq_blocked:
+                        st.info("Bayesian TBR is disabled until the frequency mismatch warning above (in the validation setup) is acknowledged or resolved.")
+                    if st.button("Run Bayesian Time-Based Regression (TBR)", width='stretch', type="primary", key="run_bayes_tab4", disabled=_bayes_freq_blocked):
                         with st.spinner(f"Running Bayesian TBR using {selected_bayes_method}..."):
                             pre_start_ts = pd.Timestamp(pre_start)
                             pre_end_ts = pd.Timestamp(pre_end)
@@ -4235,7 +4463,25 @@ with tab4:
                             combined_end_ts = max(_combined_end_candidates)
 
                             full_mask = (agg_df_bayes["date"] >= pre_start_ts) & (agg_df_bayes["date"] <= combined_end_ts)
-                            model_full_bayes = build_model_matrix(agg_df_bayes[full_mask], bayes_control_list, test_regions_val)
+                            model_full_bayes, bayes_matrix_diagnostics = build_model_matrix(agg_df_bayes[full_mask], bayes_control_list, test_regions_val)
+
+                            _bayes_pct_dropped = bayes_matrix_diagnostics.get("pct_rows_dropped", 0.0)
+                            _bayes_rows_dropped = bayes_matrix_diagnostics.get("rows_dropped", 0)
+                            _bayes_rows_before = bayes_matrix_diagnostics.get("rows_before_dropna", 0)
+                            if _bayes_rows_dropped > 0 and _bayes_pct_dropped > 20:
+                                st.error(
+                                    f"{_bayes_rows_dropped} of {_bayes_rows_before} rows ({_bayes_pct_dropped:.1f}%) were removed because "
+                                    "the test series or at least one selected control had missing KPI values. "
+                                    "This is a large share of the data and the Bayesian TBR result may be unreliable. "
+                                    f"Controls with missing values: {', '.join(bayes_matrix_diagnostics.get('control_columns_with_missing', [])) or 'none'}."
+                                )
+                            elif _bayes_rows_dropped > 0 and _bayes_pct_dropped > 10:
+                                st.warning(
+                                    f"{_bayes_rows_dropped} of {_bayes_rows_before} rows ({_bayes_pct_dropped:.1f}%) were removed because "
+                                    "the test series or at least one selected control had missing KPI values. "
+                                    "This can affect Bayesian TBR reliability. "
+                                    f"Controls with missing values: {', '.join(bayes_matrix_diagnostics.get('control_columns_with_missing', [])) or 'none'}."
+                                )
 
                             if bayes_include_lag:
                                 model_full_bayes, bayes_model_feature_cols, bayes_lagged_feature_map, bayes_lag_drop_metadata = add_lagged_control_features(
