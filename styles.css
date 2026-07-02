@@ -1,0 +1,439 @@
+:root {
+  --bg: #F8FAFC;
+  --card: #FFFFFF;
+  --text: #111827;
+  --text-light: #4B5563;
+  --muted: #6B7280;
+  --border: #E5E7EB;
+  --teal: #0F766E;
+  --teal-dark: #0D5D5A;
+  --teal-light: #CCFBF1;
+  --teal-soft: #E6F7F5;
+  --purple: #7C3AED;
+  --purple-dark: #6D28D9;
+  --purple-light: #EDE9FE;
+  --success: #10B981;
+  --warning: #F59E0B;
+  --error: #EF4444;
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1);
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    background-color: transparent;
+}
+
+/* Base styles */
+html, body, [data-testid="stAppViewContainer"] { 
+  background: var(--bg); 
+  color: var(--text);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* Main container */
+.block-container { 
+  max-width: 1400px; 
+  padding-top: 2rem; 
+  padding-bottom: 2rem;
+}
+
+/* Sidebar styling */
+[data-testid="stSidebar"] { 
+  border-right: 1px solid var(--border); 
+  background: var(--card);
+  box-shadow: var(--shadow-sm);
+}
+
+[data-testid="stSidebarUserContent"] { 
+  padding-top: 1rem;
+  padding-bottom: 2rem;
+}
+
+/* Headers */
+h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+h1 { font-size: 2rem; color: var(--text); }
+h2 { font-size: 1.5rem; color: var(--text); }
+h3 { font-size: 1.25rem; color: var(--text); }
+
+/* Cards / Containers */
+.stExpander, [data-testid="stMetric"], .stAlert {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+
+.stExpander:hover {
+  border-color: var(--teal-light);
+  transition: all 0.2s ease;
+}
+
+/* Metrics grid */
+[data-testid="stMetric"] {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 1rem;
+  box-shadow: var(--shadow-sm);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  gap: 0.5rem;
+}
+
+[data-testid="stMetric"]:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--teal-light);
+}
+
+[data-testid="stMetricLabel"] { 
+  color: var(--text-light);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+[data-testid="stMetricValue"] {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: var(--teal);
+}
+
+/* Fallback metric selector for older Streamlit versions */
+.stMetric {
+  gap: 0.5rem;
+}
+
+/* Buttons */
+.stButton > button {
+  border-radius: var(--radius-sm);
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+
+.stButton > button[kind="primary"] {
+  background: var(--teal);
+  border: 1px solid var(--teal);
+  color: #fff;
+}
+
+.stButton > button[kind="primary"]:hover {
+  background: var(--teal-dark);
+  border-color: var(--teal-dark);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+.stButton > button:not([kind="primary"]) {
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.stButton > button:not([kind="primary"]):hover {
+  background: var(--bg);
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+/* Accessibility - focus outlines */
+button:focus-visible, 
+input:focus-visible, 
+select:focus-visible, 
+textarea:focus-visible, 
+[tabindex]:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Dataframes and tables */
+[data-testid="stDataFrame"], .stDataFrame {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+/* Expander headers */
+.streamlit-expanderHeader {
+  font-weight: 500;
+  background: var(--bg);
+  border-radius: var(--radius-md);
+}
+
+.streamlit-expanderHeader:hover {
+  background: var(--teal-soft);
+  color: var(--teal);
+}
+
+/* Expander icon animation */
+.streamlit-expanderHeader svg {
+  transition: transform 0.2s ease;
+}
+
+.streamlit-expanderHeader[aria-expanded="true"] svg {
+  transform: rotate(90deg);
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+  gap: 2px;
+  background: var(--card);
+  border-bottom: 2px solid var(--border);
+  padding-bottom: 0;
+}
+
+.stTabs [data-baseweb="tab"] {
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  padding: 0.5rem 1.1rem;
+  font-weight: 500;
+  color: var(--text-light);
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.stTabs [data-baseweb="tab"]:hover {
+  color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.stTabs [aria-selected="true"] {
+  color: var(--teal);
+  background: var(--card);
+  border-bottom: 2px solid var(--teal) !important;
+  box-shadow: none !important;
+  margin-bottom: -2px;
+}
+
+/* Select boxes and inputs */
+.stSelectbox, .stMultiSelect, .stSlider {
+  margin-bottom: 0.5rem;
+}
+
+.stSelectbox > div, .stMultiSelect > div {
+  border-radius: var(--radius-sm);
+}
+
+/* Radio buttons */
+.stRadio > div {
+  gap: 1rem;
+}
+
+.stRadio label {
+  font-weight: 500;
+}
+
+/* Dividers */
+hr {
+  margin: 1.5rem 0;
+  border-color: var(--border);
+}
+
+/* Alert messages */
+.stAlert {
+  border-left: 4px solid;
+  border-radius: var(--radius-md);
+}
+
+.stAlert[data-testid="stAlertSuccess"] { 
+  border-left-color: var(--success);
+}
+
+.stAlert[data-testid="stAlertWarning"] { 
+  border-left-color: var(--warning);
+}
+
+.stAlert[data-testid="stAlertError"] { 
+  border-left-color: var(--error);
+}
+
+/* NO PROGRESS BAR CSS - using Streamlit default (which works) */
+
+/* Captions and muted text */
+.small-muted, .stCaption, caption {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+/* Code blocks */
+.stCodeBlock {
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+}
+
+/* Divider styling */
+.custom-divider {
+  margin: 1rem 0;
+  border-top: 1px solid var(--border);
+}
+
+/* Tooltips */
+[data-testid="stTooltipIcon"] {
+  color: var(--muted);
+}
+
+[data-testid="stTooltipIcon"]:hover {
+  color: var(--teal);
+}
+
+/* Success/Info/Warning/Error boxes */
+.stSuccess, .stInfo, .stWarning, .stError {
+  border-radius: var(--radius-md);
+}
+
+/* Checkbox */
+.stCheckbox label {
+  font-weight: 500;
+}
+
+/* Slider styling */
+.stSlider [data-baseweb="slider"] {
+  height: 4px;
+}
+
+.stSlider [data-baseweb="slider"] .st-eb {
+  background: var(--teal-light);
+}
+
+.stSlider [data-testid="stThumbValue"] {
+  background: var(--teal);
+  border: 2px solid var(--card);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Loading spinner */
+[data-testid="stStatusWidget"] svg {
+  stroke: var(--teal);
+}
+
+/* Images */
+img {
+  border-radius: var(--radius-sm);
+}
+
+/* Expander content padding */
+.streamlit-expanderContent {
+  padding-top: 1rem;
+  padding-bottom: 0.5rem;
+}
+
+/* Responsive design */
+@media (max-width: 900px) {
+  .block-container { 
+    padding-top: 1.5rem; 
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+  
+  [data-testid="stMetric"] {
+    padding: 0.75rem;
+  }
+  
+  [data-testid="stMetricValue"] {
+    font-size: 1.25rem;
+  }
+  
+  h1 { font-size: 1.75rem; }
+  h2 { font-size: 1.35rem; }
+  h3 { font-size: 1.15rem; }
+}
+
+/* Dark mode support using Streamlit's native .dark class */
+.dark {
+  --bg: #0F172A;
+  --card: #1E293B;
+  --text: #F1F5F9;
+  --text-light: #CBD5E1;
+  --muted: #94A3B8;
+  --border: #334155;
+}
+
+/* Fallback dark mode using system preference */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0F172A;
+    --card: #1E293B;
+    --text: #F1F5F9;
+    --text-light: #CBD5E1;
+    --muted: #94A3B8;
+    --border: #334155;
+  }
+  
+  [data-testid="stMetric"] {
+    background: var(--card);
+  }
+  
+  .stButton > button:not([kind="primary"]) {
+    background: var(--card);
+    color: var(--text);
+  }
+}
+
+/* ============================================
+   FIX: Remove text cursor from select boxes
+   ============================================ */
+
+/* Hide blinking caret/text cursor on all selectboxes */
+.stSelectbox input,
+.stMultiSelect input,
+[data-baseweb="select"] input {
+  caret-color: transparent !important;
+}
+
+/* Force pointer cursor on select containers */
+.stSelectbox [data-baseweb="select"],
+.stMultiSelect [data-baseweb="select"],
+.stSelectbox [data-baseweb="select"] > div,
+.stSelectbox .st-b8 {
+  cursor: pointer !important;
+}
+
+/* Make dropdown options use pointer cursor */
+[data-baseweb="popover"] [role="option"] {
+  cursor: pointer !important;
+}
+
+/* Remove text selection highlight on click */
+.stSelectbox input::selection {
+  background: transparent;
+}
+
+/* ============================================
+   FIX: Remove green focus box from dropdowns
+   ============================================ */
+
+/* Remove focus rings from select boxes when clicked */
+.stSelectbox *:focus,
+.stSelectbox *:focus-visible,
+.stSelectbox *:focus-within,
+[data-baseweb="select"] *:focus,
+[data-baseweb="select"] *:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+/* Keep subtle indicator for keyboard users only */
+.stSelectbox input:focus-visible {
+  outline: 1px solid var(--teal) !important;
+  outline-offset: -1px !important;
+}
+
+/* Style dropdown item hover and selection without green box */
+[data-baseweb="popover"] [role="option"]:hover {
+  background-color: var(--teal-soft) !important;
+}
+
+[data-baseweb="popover"] [role="option"][aria-selected="true"] {
+  background-color: var(--teal-light) !important;
+}

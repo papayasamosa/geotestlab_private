@@ -1,0 +1,12 @@
+streamlit
+pandas==2.2.2
+numpy
+scikit-learn
+scipy==1.11.4
+altair
+plotly
+openpyxl
+python-calamine
+matplotlib==3.7.5
+pymc==5.10.4
+arviz==0.16.1
