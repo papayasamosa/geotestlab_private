@@ -3137,7 +3137,7 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         {"Metric": "A. CONTROL SELECTION", "is_section": True},
         {"Metric": "Control Pool Size", "key": "control_pool_size"},
         {"Metric": "Controls Selected", "key": "controls_selected"},
-        {"Metric": "Selected Features", "key": "n_selected_features"},
+        {"Metric": "Predictors Selected", "key": "n_selected_features"},
 
         {"Metric": "B. PRE-PERIOD FIT", "is_section": True},
         {"Metric": "Pre-Period Correlation", "key": "pre_corr"},
@@ -3145,46 +3145,45 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         {"Metric": "Pre-Period sMAPE (%)", "key": "pre_smape"},
         {"Metric": "Pre-Period RMSE", "key": "pre_rmse"},
 
-        {"Metric": "C. ROLLING VALIDATION", "is_section": True},
-        {"Metric": "Validation Method", "key": "validation_method_label"},
-        {"Metric": "Rolling Validation sMAPE (%)", "key": "holdout_smape"},
-        {"Metric": "Rolling Validation Error", "key": "rolling_validation_error_risk"},
-        {"Metric": "Rolling-Origin sMAPE — Worst Case (P90)", "key": "rolling_smape_p90"},
-        {"Metric": "Rolling Validation RMSE", "key": "holdout_rmse"},
-        {"Metric": "Rolling Bias (%)", "key": "rolling_bias_pct_mean"},
-        {"Metric": "Rolling Bias Risk", "key": "rolling_bias_risk"},
+        {"Metric": "C. ROLLING-ORIGIN VALIDATION", "is_section": True},
+        {"Metric": "Validation sMAPE (%)", "key": "holdout_smape"},
+        {"Metric": "Validation RMSE", "key": "holdout_rmse"},
+        {"Metric": "Validation Error Risk", "key": "rolling_validation_error_risk"},
+        {"Metric": "Average Bias (%)", "key": "rolling_bias_pct_mean"},
+        {"Metric": "Bias Risk", "key": "rolling_bias_risk"},
 
         {"Metric": "D. OVERFITTING CHECK", "is_section": True},
-        {"Metric": "Overfitting Gap, sMAPE percentage points", "key": "overfit_gap_smape"},
+        {"Metric": "Pre-Period vs Validation sMAPE Gap (pp)", "key": "overfit_gap_smape"},
         {"Metric": "Overfitting Risk", "key": "overfitting_risk"},
 
         {"Metric": "E. RESIDUAL DIAGNOSTICS", "is_section": True},
         {"Metric": "Durbin-Watson", "key": "dw_stat"},
         {"Metric": "Autocorrelation Risk", "key": "autocorrelation_risk"},
 
-        {"Metric": "F. OVERALL RELIABILITY", "is_section": True},
+        {"Metric": "F. PLACEBO TESTING", "is_section": True},
+        {"Metric": "Placebo Windows", "key": "placebo_windows"},
+        {"Metric": "Average Placebo sMAPE (%)", "key": "median_placebo_smape"},
+        {"Metric": "Median Placebo Uplift", "key": "median_placebo_uplift_pct"},
+        {"Metric": "95% Placebo Uplift Range", "key": "placebo_range_pct"},
+
+        {"Metric": "G. OVERALL RELIABILITY", "is_section": True},
         {"Metric": "Counterfactual Reliability", "key": "counterfactual_reliability"},
         {"Metric": "Reliability Drivers", "key": "reliability_drivers"},
 
-        {"Metric": "G. PLACEBO TESTING", "is_section": True},
-        {"Metric": "Placebo Windows", "key": "placebo_windows"},
-        {"Metric": "Median Placebo Uplift", "key": "median_placebo_uplift_pct"},
-        {"Metric": "95% Placebo Uplift Range", "key": "placebo_range_pct"},
-        {"Metric": "Placebo Forecast Error — avg sMAPE", "key": "median_placebo_smape"},
-        {"Metric": "Placebo Forecast Error — worst case (P95)", "key": "p95_placebo_smape"},
     ]
     show_test_impact = (mode == "Evaluate" and test_start is not None)
     if show_test_impact:
         comparison_rows += [
-            {"Metric": "G. OBSERVED UPLIFT VS PLACEBOS", "is_section": True},
-            {"Metric": "Observed Uplift Percentile vs Placebos", "key": "placebo_percentile_rank"},
-            {"Metric": "Observed Uplift p-value", "key": "placebo_p_two_sided"},
-            {"Metric": "Observed Uplift z-score", "key": "placebo_z_score"},
-            {"Metric": "H. TEST IMPACT", "is_section": True},
+            {"Metric": "H. OBSERVED UPLIFT VS PLACEBOS", "is_section": True},
+            {"Metric": "Uplift Percentile vs Placebos", "key": "placebo_percentile_rank"},
+            {"Metric": "Uplift p-value", "key": "placebo_p_two_sided"},
+            {"Metric": "Uplift z-score", "key": "placebo_z_score"},
+            
+            {"Metric": "I. TEST IMPACT", "is_section": True},
             {"Metric": "Observed Uplift", "key": "observed_uplift"},
             {"Metric": "Observed Uplift (%)", "key": "observed_uplift_pct"},
-            {"Metric": "Test Period Actual (total)", "key": "test_period_actual"},
-            {"Metric": "Test Period Counterfactual (total)", "key": "test_period_counterfactual"},
+            {"Metric": "Actual Total", "key": "test_period_actual"},
+            {"Metric": "Expected Total Without Test (Counterfactual)", "key": "test_period_counterfactual"},
         ]
 
     def _fmt_pct(v, decimals=1):
@@ -3308,7 +3307,7 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
     st.dataframe(styled_comp, width='stretch', hide_index=False)
 
     st.caption(
-        "Durbin-Watson checks whether residuals are autocorrelated. Values near 2 are good. Values far "
+        "**Durbin-Watson** checks whether residuals are autocorrelated. Values near 2 are good. Values far "
         "below or above 2 suggest the model is missing time patterns."
     )
     st.caption(
@@ -3327,7 +3326,10 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
     st.caption(
         "**Counterfactual Reliability** is the overall traffic-light summary. It takes the worst result "
         "from the main validation checks: rolling validation error, overfitting gap, rolling bias, and "
-        "residual autocorrelation. **Reliability Drivers** explains which check(s) drove the rating. "
+        "residual autocorrelation."
+    )
+    st.caption(
+        "**Reliability Drivers** explains which check(s) drove the rating. "
         "Traffic-light bands are interpretation aids based on validation diagnostics — they are not "
         "standalone hypothesis tests."
     )
