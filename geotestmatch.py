@@ -4434,16 +4434,11 @@ def render_time_series_validation(mode: str):
                     f"Rolling-origin validation used a **{_vw}-{_period_word}** forecast horizon "
                     f"and required at least **{_mt} {_period_word_plural}** of training history before each validation window."
                 )
-                _rcv_col1, _rcv_col2 = st.columns(2)
+                _rcv_col1 = st.columns(1)
                 _rcv_col1.metric(
-                    "Avg sMAPE (out-of-sample)",
+                    "Average Out-of-Sample sMAPE",
                     f"{res['holdout_smape_mean']:.1f}%" if not np.isnan(res['holdout_smape_mean']) else "-",
                     help="Average sMAPE across all rolling-origin validation windows. Out-of-sample — more reliable than pre-period fit."
-                )
-                _rcv_col2.metric(
-                    "Avg RMSE (out-of-sample)",
-                    f"{res['holdout_rmse_mean']:.0f}" if not np.isnan(res['holdout_rmse_mean']) else "-",
-                    help="Average RMSE across all rolling-origin validation windows, in the same units as the KPI."
                 )
                 _fold_df = res.get("rolling_origin_folds", pd.DataFrame())
                 if not _fold_df.empty:
