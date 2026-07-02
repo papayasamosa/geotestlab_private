@@ -290,11 +290,11 @@ def classify_autocorrelation_risk(dw_stat):
     if 1.7 <= dw <= 2.3:
         return "🟢 Low autocorrelation"
     elif 1.3 <= dw < 1.7:
-        return "🟠 Positive autocorrelation"
+        return "🟡 Moderate positive autocorrelation"
     elif dw < 1.3:
         return "🔴 High positive autocorrelation"
     elif 2.3 < dw <= 2.7:
-        return "🟠 Negative autocorrelation"
+        return "🟡 Moderate negative autocorrelation"
     else:
         return "🔴 High negative autocorrelation"
 
