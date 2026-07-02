@@ -3182,7 +3182,7 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
             {"Metric": "I. TEST IMPACT", "is_section": True},
             {"Metric": "Observed Uplift", "key": "observed_uplift"},
             {"Metric": "Observed Uplift (%)", "key": "observed_uplift_pct"},
-            {"Metric": "Actual Total", "key": "test_period_actual"},
+            {"Metric": "Test Group Actual Total", "key": "test_period_actual"},
             {"Metric": "Expected Total Without Test (Counterfactual)", "key": "test_period_counterfactual"},
         ]
 
