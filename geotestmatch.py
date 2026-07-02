@@ -17,8 +17,8 @@ import re
 
 
 # New imports for validation module
-from sklearn.linear_model import ElasticNetCV, RidgeCV
-from sklearn.model_selection import TimeSeriesSplit, KFold
+from sklearn.linear_model import ElasticNetCV, RidgeCV, ElasticNet
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, r2_score
 
 warnings.filterwarnings("ignore")
@@ -327,11 +327,18 @@ def calculate_overfit_gap(pre_smape, rolling_smape):
 
 def calculate_feature_density(n_selected_features, n_pre_periods):
     """
-    Feature density: number of selected model features (same-period + lag terms)
-    relative to the number of pre-period observations/periods available to fit them
-    (weeks for weekly data, days for daily data). A high density means the model has
-    relatively little data per parameter, which increases the risk of fitting
-    coincidental historical relationships.
+    Feature density: number of selected model features divided by the number of
+    pre-period observations/periods available to estimate the relationship
+    between controls and the test group.
+
+    This does not mean individual controls have missing data. It means the model
+    has more predictors relative to the number of historical time points. A high
+    value gives the model more flexibility to fit coincidental historical patterns,
+    especially when many controls or lagged terms are selected.
+
+    Weekly data uses pre-period weeks as observations. Daily data uses pre-period
+    days as observations.
+
     Returns np.nan if inputs are missing or n_pre_periods <= 0.
     """
     if n_selected_features is None or n_pre_periods is None:
@@ -344,9 +351,9 @@ def calculate_feature_density(n_selected_features, n_pre_periods):
 
 def format_feature_density(n_selected_features, n_pre_periods, feature_density):
     """
-    Formats Feature Density consistently everywhere it is displayed, as a ratio
-    followed by its decimal value, e.g. "4 / 12 = 0.33". Never formats Feature
-    Density as a percentage.
+    Formats Feature Density as selected features / pre-period observations = decimal
+    value, for example "4 / 12 = 0.33". Never formats Feature Density as a
+    percentage (not "33.3%" and not "4 / 12 (33.3%)").
     Returns "N/A" if any input is missing or not a finite number.
     """
     if (
@@ -378,7 +385,8 @@ def classify_overfitting_risk(overfit_gap_smape, feature_density, rolling_bias_p
       A large positive gap signals classic overfitting (looks good in-sample, worse
       out-of-sample).
     - feature_density: selected model features per pre-period period (week/day).
-      A high density means little historical data per model parameter.
+      A high density means the model has more predictors relative to the number of
+      historical time points available to estimate a stable relationship.
     - rolling_bias_pct: optional rolling-origin bias (%). Large absolute bias increases
       risk by one level.
     - rolling_smape_mean: optional absolute rolling-origin sMAPE (%). High absolute
@@ -786,6 +794,41 @@ def safe_tscv(n_splits, n_periods):
     n = min(n_splits, n_periods // 3)
     return TimeSeriesSplit(n_splits=max(2, n))
 
+def build_regularized_model(method_name, n_periods, n_splits_pref=5, fixed_alpha=1.0):
+    """
+    Builds an ElasticNet-family model for the given method_name ("enet" or "lasso").
+
+    Uses TimeSeriesSplit-based ElasticNetCV whenever there are enough pre-period
+    observations to support safe, leakage-free time-series cross-validation.
+
+    If there are too few periods for TimeSeriesSplit, this does NOT fall back to
+    regular K-fold CV — standard K-fold (even with shuffle=False) can still let
+    later time points influence hyperparameter choices for earlier ones, which is
+    a form of leakage for time-series data. Instead, it returns a conservative
+    fixed-alpha ElasticNet with no CV-based hyperparameter search.
+
+    Returns: (model, cv_status) where cv_status is a short human-readable string
+    describing whether TimeSeriesSplit CV or the conservative fallback was used.
+    """
+    tscv = safe_tscv(n_splits_pref, n_periods)
+    if tscv is not None:
+        if method_name == "enet":
+            model = ElasticNetCV(l1_ratio=[.1, .3, .5, .7, .9, .95], alphas=np.logspace(-4, 4, 50),
+                                  cv=tscv, max_iter=10000, random_state=42)
+        else:  # lasso
+            model = ElasticNetCV(l1_ratio=1, alphas=np.logspace(-4, 4, 100),
+                                  cv=tscv, max_iter=10000, random_state=42)
+        return model, "TimeSeriesSplit cross-validation used to select regularisation strength."
+    # Too few pre-period observations for safe, leakage-free time-series CV.
+    l1_ratio = 1.0 if method_name == "lasso" else 0.5
+    model = ElasticNet(alpha=fixed_alpha, l1_ratio=l1_ratio, max_iter=10000, random_state=42)
+    cv_status = (
+        f"Insufficient history for TimeSeriesSplit; used conservative fixed-alpha "
+        f"ElasticNet fallback (alpha={fixed_alpha}, l1_ratio={l1_ratio}) instead of "
+        f"cross-validated regularisation."
+    )
+    return model, cv_status
+
 def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=None, n_splits=5, model_type="enet",
                                min_training_weeks=None):
     """
@@ -795,7 +838,13 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
     horizon and min_training_periods are row counts (periods), matching the granularity of the
     underlying data — weeks for weekly data, days for daily data.
 
-    Returns: fold_df (DataFrame), rolling_smape_mean (float), rolling_rmse_mean (float)
+    Uses TimeSeriesSplit-based cross-validation to tune model regularisation whenever a fold's
+    training window has enough periods. Never falls back to regular K-fold CV, since that can leak
+    future information into hyperparameter tuning for time-series data; folds with too little
+    training history instead use a conservative fixed-alpha model (see build_regularized_model()).
+
+    Returns: fold_df (DataFrame, includes a "used_cv_fallback" column per fold), rolling_smape_mean
+    (float), rolling_rmse_mean (float), cv_status (str describing CV vs. fallback usage across folds).
     For backwards compatibility, also accepts n_splits (ignored — all valid folds are used) and
     min_training_weeks as an alias for min_training_periods.
     """
@@ -806,10 +855,11 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
         "fold_number", "training_periods", "forecast_horizon_periods",
         "training_weeks", "forecast_horizon_weeks",
         "smape", "rmse", "bias", "bias_pct", "uplift_error", "uplift_error_pct",
-        "train_start_date", "train_end_date", "test_start_date", "test_end_date"
+        "train_start_date", "train_end_date", "test_start_date", "test_end_date",
+        "used_cv_fallback"
     ])
     if n < min_training_periods + horizon:
-        return empty_df, np.nan, np.nan
+        return empty_df, np.nan, np.nan, "No folds: insufficient pre-period history for rolling-origin validation."
 
     folds = []
     fold_num = 0
@@ -827,18 +877,11 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
         train_X_scaled = scaler.fit_transform(train_X)
         test_X_scaled = scaler.transform(test_X)
 
-        if model_type == "enet":
-            model = ElasticNetCV(l1_ratio=[.1, .3, .5, .7, .9, .95], alphas=np.logspace(-4, 4, 50),
-                                 cv=safe_tscv(3, len(train_y)), max_iter=10000, random_state=42)
-        elif model_type == "lasso":
-            model = ElasticNetCV(l1_ratio=1, alphas=np.logspace(-4, 4, 100),
-                                 cv=safe_tscv(3, len(train_y)), max_iter=10000, random_state=42)
-        else:
-            return empty_df, np.nan, np.nan
+        if model_type not in ("enet", "lasso"):
+            return empty_df, np.nan, np.nan, "Unsupported model_type"
 
-        if model.cv is None:
-            model.cv = KFold(n_splits=3, shuffle=False)
-            warnings.warn("Falling back to standard KFold (not time-series) due to insufficient training periods.")
+        model, fold_cv_status = build_regularized_model(model_type, len(train_y), n_splits_pref=3)
+        used_cv_fallback = model.__class__.__name__ != "ElasticNetCV"
 
         model.fit(train_X_scaled, train_y)
         pred = model.predict(test_X_scaled)
@@ -879,15 +922,30 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
             "train_end_date": train_end_date,
             "test_start_date": test_start_date,
             "test_end_date": test_end_date,
+            "used_cv_fallback": used_cv_fallback,
         })
 
     if not folds:
-        return empty_df, np.nan, np.nan
+        return empty_df, np.nan, np.nan, "No folds: insufficient pre-period history for rolling-origin validation."
 
     fold_df = pd.DataFrame(folds)
     rolling_smape_mean = float(fold_df["smape"].mean())
     rolling_rmse_mean = float(fold_df["rmse"].mean())
-    return fold_df, rolling_smape_mean, rolling_rmse_mean
+    n_fallback_folds = int(fold_df["used_cv_fallback"].sum())
+    if n_fallback_folds == 0:
+        cv_status = "TimeSeriesSplit cross-validation used to select regularisation strength in all folds."
+    elif n_fallback_folds == len(fold_df):
+        cv_status = (
+            "Insufficient history for TimeSeriesSplit in all folds; used conservative "
+            "fixed-alpha ElasticNet fallback instead of cross-validated regularisation."
+        )
+    else:
+        cv_status = (
+            f"Insufficient history for TimeSeriesSplit in {n_fallback_folds} of {len(fold_df)} folds; "
+            "those folds used a conservative fixed-alpha ElasticNet fallback instead of "
+            "cross-validated regularisation."
+        )
+    return fold_df, rolling_smape_mean, rolling_rmse_mean, cv_status
 
 def placebo_analysis(uplift_list, real_uplift):
     uplift_arr = np.array(uplift_list)
@@ -1007,15 +1065,8 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
 
     # Determine model type from method_name
     # method_name is either "enet" or "lasso"
-    if method_name == "enet":
-        model = ElasticNetCV(l1_ratio=[.1, .3, .5, .7, .9, .95], alphas=np.logspace(-4,4,50),
-                             cv=safe_tscv(5, len(y_pre)), max_iter=10000, random_state=42)
-    else:  # lasso
-        model = ElasticNetCV(l1_ratio=1, alphas=np.logspace(-4,4,100),
-                             cv=safe_tscv(5, len(y_pre)), max_iter=10000, random_state=42)
-    if model.cv is None:
-        model.cv = KFold(n_splits=5, shuffle=False)
-        warnings.warn("Falling back to standard KFold (not time-series) due to insufficient training periods for CV.")
+    model, main_model_cv_status = build_regularized_model(method_name, len(y_pre), n_splits_pref=5)
+    main_model_used_cv_fallback = model.__class__.__name__ != "ElasticNetCV"
     model.fit(X_pre_scaled, y_pre)
     y_pred_pre = model.predict(X_pre_scaled)
     corr, r2, s, rmse = compute_metrics(y_pre, y_pred_pre)
@@ -1027,7 +1078,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     # Rolling-origin validation (using the same model type)
     # horizon matches placebo_length_periods so both use the same window length
     cv_horizon = placebo_length_periods if placebo_length_periods is not None else frequency_config["default_validation_horizon_periods"]
-    fold_df, rolling_smape_mean, rolling_rmse_mean = rolling_origin_validation(
+    fold_df, rolling_smape_mean, rolling_rmse_mean, rolling_cv_status = rolling_origin_validation(
         X_pre, y_pre,
         horizon=cv_horizon,
         min_training_periods=min_training_periods,
@@ -1037,6 +1088,18 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     # Backwards-compat aliases
     holdout_smape_mean = rolling_smape_mean
     holdout_rmse_mean = rolling_rmse_mean
+
+    # ---- CV status (item 6): never silently falls back to regular KFold for time-series
+    # data. Surface whether the main pre-period model and/or rolling-origin folds had to use
+    # the conservative fixed-alpha fallback because there wasn't enough history for TimeSeriesSplit.
+    cv_status = f"Main model: {main_model_cv_status} Rolling-origin folds: {rolling_cv_status}"
+    if main_model_used_cv_fallback or (not fold_df.empty and bool(fold_df["used_cv_fallback"].any())):
+        st.warning(
+            "⚠️ Insufficient pre-period history for TimeSeriesSplit cross-validation in one or more "
+            f"models for **{method_name}**. A conservative fixed-alpha ElasticNet fallback was used "
+            "instead of regular K-fold CV, to avoid leaking future data into hyperparameter tuning. "
+            "Treat this method's results with extra caution."
+        )
 
     # Additional rolling-origin summary stats
     if not fold_df.empty:
@@ -1154,15 +1217,9 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
                     y_te = m_test["test_kpi"].values
                     scaler_p = StandardScaler()
                     X_tr_scaled = scaler_p.fit_transform(X_tr)
-                    # Use the same model type as main
-                    if method_name == "enet":
-                        model_p = ElasticNetCV(l1_ratio=[.1, .3, .5, .7, .9, .95], alphas=np.logspace(-4,4,50),
-                                               cv=safe_tscv(3, len(y_tr)), max_iter=10000, random_state=42)
-                    else:
-                        model_p = ElasticNetCV(l1_ratio=1, alphas=np.logspace(-4,4,100),
-                                               cv=safe_tscv(3, len(y_tr)), max_iter=10000, random_state=42)
-                    if model_p.cv is None:
-                        model_p.cv = KFold(n_splits=3, shuffle=False)
+                    # Use the same model type as main. Never falls back to regular KFold for
+                    # time-series data — see build_regularized_model().
+                    model_p, _placebo_cv_status = build_regularized_model(method_name, len(y_tr), n_splits_pref=3)
                     model_p.fit(X_tr_scaled, y_tr)
                     pred_p = model_p.predict(scaler_p.transform(X_te))
                     uplift_p = y_te.sum() - pred_p.sum()
@@ -1286,6 +1343,8 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         "overfit_gap_smape": overfit_gap_smape,
         "overfit_gap_rmse": overfit_gap_rmse,
         "feature_density": feature_density,
+        "cv_status": cv_status,
+        "used_cv_fallback": main_model_used_cv_fallback or (not fold_df.empty and bool(fold_df["used_cv_fallback"].any())),
         "n_selected_features": n_selected_features,
         "n_pre_periods": n_pre_periods,
         "n_pre_weeks": n_pre_periods,  # backward-compatible alias
@@ -3848,17 +3907,20 @@ def render_time_series_validation(mode: str):
             _n_pre_per = res.get("n_pre_periods", res.get("n_pre_weeks", None))
             if _fd is not None and not (isinstance(_fd, float) and np.isnan(_fd)) and _n_sel_feat is not None and _n_pre_per is not None:
                 _fd_display = format_feature_density(_n_sel_feat, _n_pre_per, _fd)
+                _fd_period_word = vres_freq_config['period_label_plural']
                 if _fd > 0.50:
                     st.error(
                         f"High model reliability risk: the selected model uses {_n_sel_feat} features across "
-                        f"{_n_pre_per} pre-period observations (feature density = {_fd_display}). "
-                        "This means there is little historical data per model feature, so the uplift estimate may be unstable."
+                        f"{_n_pre_per} pre-period {_fd_period_word} (feature density = {_fd_display}). "
+                        "This means the model has many predictors relative to the number of historical time "
+                        "points, so it may fit coincidental patterns and produce an unstable uplift estimate."
                     )
                 elif _fd > 0.30:
                     st.warning(
                         f"Moderate model reliability risk: the selected model uses {_n_sel_feat} features across "
-                        f"{_n_pre_per} pre-period observations (feature density = {_fd_display}). "
-                        "Review rolling-origin and placebo diagnostics before trusting the result."
+                        f"{_n_pre_per} pre-period {_fd_period_word} (feature density = {_fd_display}). "
+                        "The model has a relatively high number of predictors for the available pre-period "
+                        "history. Review rolling-origin and placebo diagnostics before trusting the result."
                     )
 
             # ---- High validation error, even when the overfit gap is small (item 13) ----
@@ -4067,6 +4129,7 @@ def render_time_series_validation(mode: str):
             {"Metric": "Residual Autocorrelation Risk", "key": "autocorrelation_risk"},
 
             {"Metric": "D. ROLLING-ORIGIN VALIDATION", "is_section": True},
+            {"Metric": "CV Method", "key": "cv_status_short"},
             {"Metric": "Rolling Validation sMAPE (%)", "key": "holdout_smape"},
             {"Metric": "Rolling-Origin sMAPE — Worst Case (P90)", "key": "rolling_smape_p90"},
             {"Metric": "Rolling-Origin RMSE", "key": "holdout_rmse"},
@@ -4123,6 +4186,8 @@ def render_time_series_validation(mode: str):
             elif key == "n_selected_features":
                 v = res.get("n_selected_features", None)
                 return str(v) if v is not None else "N/A"
+            elif key == "cv_status_short":
+                return "🟠 Fixed-alpha fallback (some/all folds)" if res.get("used_cv_fallback") else "🟢 TimeSeriesSplit CV"
             elif key == "pre_corr":
                 return _fmt_num(res.get('corr', np.nan), decimals=3)
             elif key == "pre_r2":
@@ -4221,9 +4286,10 @@ def render_time_series_validation(mode: str):
             "may be missing time structure and uncertainty may be understated."
         )
         st.caption(
-            f"**{FEATURE_DENSITY_LABEL}** is the number of selected model features divided by the number of "
-            f"pre-period {vres_freq_config['period_label_plural']}. Higher values mean the model has less "
-            "historical data per feature, which increases the risk of overfitting."
+            f"**{FEATURE_DENSITY_LABEL}** shows how many model features are being estimated relative to the "
+            f"number of pre-period {vres_freq_config['period_label_plural']}. Higher values mean the model has "
+            "more flexibility relative to the amount of historical evidence, which can increase the risk of "
+            "fitting coincidental patterns or unstable uplift estimates."
         )
         st.caption(
             "**Overfitting / Reliability Risk** is higher when a method fits the pre-period very well but performs much worse in "
@@ -4269,7 +4335,7 @@ These metrics test the model on historical data it has never seen, making them f
 A method can look excellent in-sample and still be unreliable if it's fitting coincidental historical patterns rather than a genuine relationship.
 
 - **Overfit Gap, sMAPE percentage points** — How much worse the model performs out-of-sample versus in-sample. A large positive gap (roughly above 3–8 percentage points) suggests the pre-period fit is flattering and won't hold up.
-- **{FEATURE_DENSITY_LABEL}** — How many model features (including lagged terms) are being fit relative to how many pre-period {vres_freq_config['period_label_plural']} of data are available. A high ratio (above ~0.30–0.50) increases the risk of fitting noise.
+- **{FEATURE_DENSITY_LABEL}** — How many model features, including lagged terms, are being fit relative to how many pre-period {vres_freq_config['period_label_plural']} are available. A high ratio, roughly above 0.30–0.50, means the model may have too much flexibility for the amount of historical evidence available.
 - **Residual Autocorrelation Risk** — Interprets the Durbin-Watson statistic on a traffic-light scale. Values near 2 mean low autocorrelation; values materially below 2 flag positive autocorrelation, meaning the model may be missing time structure.
 - **Overfitting / Reliability Risk** — A Low / Moderate / High summary combining the overfit gap, the *absolute* level of rolling-origin validation error (a small gap is not reassuring if rolling-origin sMAPE itself is high), feature density, and rolling bias. Treat "High" results with real caution, especially for data-optimised methods. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess this — this is a data-availability gap, not evidence that risk is low.
 
