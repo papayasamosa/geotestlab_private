@@ -264,9 +264,12 @@ def durbin_watson_stat(residuals):
         return np.nan
     return np.sum(np.diff(residuals) ** 2) / denom
 
-def classify_autocorrelation_risk(dw_stat):
+def classify_autocorrelation_interpretation(dw_stat):
     """
-    Classify residual autocorrelation risk from the Durbin-Watson statistic.
+    Interpret the Durbin-Watson statistic for first-order residual autocorrelation.
+
+    Durbin-Watson is an established statistic. These red/amber/green labels are
+    practical interpretation bands for this app, not formal critical-value tests.
 
     Durbin-Watson is approximately:
     - 2.0 = little/no first-order autocorrelation
@@ -288,23 +291,27 @@ def classify_autocorrelation_risk(dw_stat):
     dw = float(dw_stat)
 
     if 1.7 <= dw <= 2.3:
-        return "🟢 Low autocorrelation"
+        return "🟢 Near 2: little evidence of first-order autocorrelation"
     elif 1.3 <= dw < 1.7:
-        return "🟠 Positive autocorrelation"
+        return "🟠 Below 2: possible positive autocorrelation"
     elif dw < 1.3:
-        return "🔴 High positive autocorrelation"
+        return "🔴 Far below 2: strong warning for positive autocorrelation"
     elif 2.3 < dw <= 2.7:
-        return "🟠 Negative autocorrelation"
+        return "🟠 Above 2: possible negative autocorrelation"
     else:
-        return "🔴 High negative autocorrelation"
+        return "🔴 Far above 2: strong warning for negative autocorrelation"
 
 def calculate_overfit_gap(pre_smape, rolling_smape):
     """
-    Overfit gap: how much worse the model performs out-of-sample (rolling-origin)
+    Generalisation Gap: how much worse the model performs out-of-sample (rolling-origin)
     versus in-sample (pre-period fit). A large positive gap means the model's
-    apparent pre-period accuracy does not hold up out-of-sample — a classic
-    overfitting signature. Returns np.nan if either input is missing, not finite
+    apparent pre-period accuracy does not hold up out-of-sample when predicting
+    held-out historical periods. This is a validation diagnostic, not a formal
+    statistical test. Returns np.nan if either input is missing, not finite
     (covers None, np.nan, pd.NA, and +/-inf), or not convertible to a float.
+
+    (Internal variable/function names still use "overfit_gap" for backward
+    compatibility; all user-facing labels use "Generalisation Gap".)
     """
     def _is_valid(v):
         if v is None:
@@ -325,95 +332,53 @@ def calculate_overfit_gap(pre_smape, rolling_smape):
         return np.nan
     return float(rolling_smape) - float(pre_smape)
 
-def calculate_feature_density(n_selected_features, n_pre_periods):
+def classify_counterfactual_reliability(
+    overfit_gap_smape,
+    rolling_smape_mean=None,
+    rolling_bias_pct=None,
+    autocorrelation_interpretation=None,
+):
     """
-    Feature density: number of selected model features divided by the number of
-    pre-period observations/periods available to estimate the relationship
-    between controls and the test group.
+    Classifies Counterfactual Reliability as Strong, Caution, Weak, or Insufficient data.
 
-    This does not mean individual controls have missing data. It means the model
-    has more predictors relative to the number of historical time points. A high
-    value gives the model more flexibility to fit coincidental historical patterns,
-    especially when many controls or lagged terms are selected.
+    This is a validation-based reliability diagnostic. It uses:
+    - rolling-origin validation error
+    - the generalisation gap between pre-period fit and rolling-origin validation
+    - rolling-origin validation bias
+    - residual autocorrelation interpretation from the Durbin-Watson statistic
 
-    Weekly data uses pre-period weeks as observations. Daily data uses pre-period
-    days as observations.
-
-    Returns np.nan if inputs are missing or n_pre_periods <= 0.
-    """
-    if n_selected_features is None or n_pre_periods is None:
-        return np.nan
-    if n_pre_periods is None or n_pre_periods <= 0:
-        return np.nan
-    if isinstance(n_selected_features, float) and np.isnan(n_selected_features):
-        return np.nan
-    return n_selected_features / n_pre_periods
-
-def format_feature_density(n_selected_features, n_pre_periods, feature_density):
-    """
-    Formats Feature Density as selected features / pre-period observations = decimal
-    value, for example "4 / 12 = 0.33". Never formats Feature Density as a
-    percentage (not "33.3%" and not "4 / 12 (33.3%)").
-    Returns "N/A" if any input is missing or not a finite number.
-    """
-    if (
-        n_selected_features is None
-        or n_pre_periods is None
-        or feature_density is None
-        or pd.isna(feature_density)
-        or not np.isfinite(float(feature_density))
-    ):
-        return "N/A"
-    return f"{int(n_selected_features)} / {int(n_pre_periods)} = {float(feature_density):.2f}"
-
-def classify_overfitting_risk(overfit_gap_smape, feature_density, rolling_bias_pct=None, rolling_smape_mean=None):
-    """
-    Classifies "Overfitting / Reliability Risk" as "Low", "Moderate", "High", or
-    "Insufficient data".
-
-    This is a broader model-reliability diagnostic, not just an overfitting check.
-    A small overfit gap (in-sample vs out-of-sample sMAPE) only tells you the model
-    is *consistent* between pre-period fit and rolling-origin validation — it does NOT
-    tell you the model is *accurate*. A model can have a small gap while still being a
-    poor predictor overall (high pre-period sMAPE AND high rolling-origin sMAPE). That
-    case should not be reported as "Low" risk just because the gap is small, so this
-    function also considers the absolute level of rolling-origin validation error
-    (rolling_smape_mean), alongside the overfit gap, feature density, and rolling bias.
+    It does not use custom model-complexity heuristics.
 
     Inputs:
-    - overfit_gap_smape: rolling-origin sMAPE minus pre-period sMAPE (percentage points).
-      A large positive gap signals classic overfitting (looks good in-sample, worse
-      out-of-sample).
-    - feature_density: selected model features per pre-period period (week/day).
-      A high density means the model has more predictors relative to the number of
-      historical time points available to estimate a stable relationship.
-    - rolling_bias_pct: optional rolling-origin bias (%). Large absolute bias increases
-      risk by one level.
-    - rolling_smape_mean: optional absolute rolling-origin sMAPE (%). High absolute
-      out-of-sample error increases risk even when the gap itself is small, because it
-      means the model is not predicting the test group accurately regardless of whether
-      it is "overfit" in the narrow sense.
+    - overfit_gap_smape: Generalisation Gap — rolling-origin sMAPE minus pre-period
+      sMAPE (percentage points).
+    - rolling_smape_mean: absolute rolling-origin sMAPE (%). This is the primary signal;
+      if it is missing, rolling-origin validation didn't produce a usable result, and
+      this function returns "Insufficient data" rather than guessing from the other
+      (weaker) signals alone.
+    - rolling_bias_pct: optional rolling-origin bias (%).
+    - autocorrelation_interpretation: optional string from
+      classify_autocorrelation_interpretation(), e.g. "🔴 Far below 2: strong warning
+      for positive autocorrelation" or "🟠 Above 2: possible negative autocorrelation".
 
-    - If none of overfit_gap_smape, feature_density, or rolling_smape_mean is usable,
-      returns "Insufficient data" — there isn't enough evidence to call the risk
-      anything else.
-    - If overfit_gap_smape and rolling_smape_mean are both missing (rolling-origin
-      validation didn't produce a usable result) and feature_density is low (<= 0.30),
-      also returns "Insufficient data" rather than "Low" — we haven't actually checked
-      whether the model holds up out-of-sample, so "Low" would overstate confidence.
-    - If overfit_gap_smape / rolling_smape_mean are missing but feature_density is
-      meaningfully high (> 0.30), classify risk from feature density alone ("Moderate"
-      above 0.30, "High" above 0.50) — a high feature density is still informative even
-      without rolling-origin validation.
-    - Otherwise, the full rule set (overfit gap, absolute rolling-origin sMAPE, feature
-      density, and optionally rolling bias) applies, and "Low" is a valid outcome only
-      when none of these signals indicate elevated risk.
+    Logic:
+    - If rolling_smape_mean is missing/invalid, returns "Insufficient data" — there is
+      no out-of-sample evidence to anchor a reliability call on.
+    - Otherwise, the starting level comes from rolling_smape_mean thresholds (>30 =
+      "Weak", >20 = "Caution", else "Strong"), then is downgraded by up to one level
+      each for: a large generalisation gap (>8pp downgrades straight to "Weak", >3pp
+      downgrades one level), large rolling bias (>10% downgrades one level), and
+      elevated residual autocorrelation (a 🔴 interpretation downgrades straight to
+      "Weak", a 🟠 interpretation downgrades one level).
+
+    The resulting traffic-light label is an interpretation aid based on validation
+    diagnostics, not a standalone statistical test.
 
     Missing (np.nan / None / pd.NA / +-inf) inputs are handled gracefully via
-    _is_valid() — an invalid input simply does not contribute evidence of risk
-    rather than raising an error.
+    _is_valid() — an invalid input simply does not contribute evidence rather than
+    raising an error.
     """
-    risk_levels = ["Low", "Moderate", "High"]
+    levels = ["Strong", "Caution", "Weak"]
 
     def _is_valid(v):
         if v is None:
@@ -430,59 +395,39 @@ def classify_overfitting_risk(overfit_gap_smape, feature_density, rolling_bias_p
             return False
         return True
 
-    gap_valid = _is_valid(overfit_gap_smape)
-    density_valid = _is_valid(feature_density)
-    bias_valid = _is_valid(rolling_bias_pct)
     smape_valid = _is_valid(rolling_smape_mean)
+    gap_valid = _is_valid(overfit_gap_smape)
+    bias_valid = _is_valid(rolling_bias_pct)
 
-    # Not enough evidence to classify at all.
-    if not gap_valid and not density_valid and not smape_valid:
+    # No rolling-origin validation result at all — there is nothing to anchor a
+    # reliability call on, so we don't guess.
+    if not smape_valid:
         return "Insufficient data"
 
-    # Rolling-origin validation didn't produce a usable gap or absolute error — the
-    # stronger out-of-sample checks simply haven't run. Only fall back to
-    # feature-density-only classification when density is high enough to be
-    # informative on its own; otherwise we genuinely don't know, so don't call it "Low".
-    if not gap_valid and not smape_valid:
-        if feature_density > 0.50:
-            return "High"
-        elif feature_density > 0.30:
-            return "Moderate"
-        else:
-            return "Insufficient data"
-
-    # At least one of overfit_gap_smape / rolling_smape_mean is available — apply the
-    # full rule set.
-    risk_idx = 0  # start at "Low"
-
-    def _bump(idx, to_idx):
-        return max(idx, to_idx)
+    if rolling_smape_mean > 30:
+        level_idx = 2  # Weak
+    elif rolling_smape_mean > 20:
+        level_idx = 1  # Caution
+    else:
+        level_idx = 0  # Strong
 
     if gap_valid:
         if overfit_gap_smape > 8:
-            risk_idx = _bump(risk_idx, 2)  # High
+            level_idx = 2  # Weak
         elif overfit_gap_smape > 3:
-            risk_idx = _bump(risk_idx, 1)  # Moderate
-
-    # Absolute rolling-origin validation error: catches the "generally poor model"
-    # case where pre-period and rolling sMAPE are both high but the gap is small.
-    if smape_valid:
-        if rolling_smape_mean > 30:
-            risk_idx = _bump(risk_idx, 2)  # High
-        elif rolling_smape_mean > 20:
-            risk_idx = _bump(risk_idx, 1)  # Moderate
-
-    if density_valid:
-        if feature_density > 0.50:
-            risk_idx = _bump(risk_idx, 2)  # High
-        elif feature_density > 0.30:
-            risk_idx = min(risk_idx + 1, 2)  # increase by one level, capped at High
+            level_idx = min(level_idx + 1, 2)
 
     if bias_valid:
         if abs(rolling_bias_pct) > 10:
-            risk_idx = min(risk_idx + 1, 2)  # increase by one level, capped at High
+            level_idx = min(level_idx + 1, 2)
 
-    return risk_levels[risk_idx]
+    if autocorrelation_interpretation:
+        if "🔴" in autocorrelation_interpretation:
+            level_idx = 2  # Weak
+        elif "🟠" in autocorrelation_interpretation:
+            level_idx = min(level_idx + 1, 2)
+
+    return levels[level_idx]
 
 # ------------------------------------------------------------
 # Frequency-awareness helpers (weekly vs daily time series)
@@ -804,11 +749,17 @@ def build_regularized_model(method_name, n_periods, n_splits_pref=5, fixed_alpha
     If there are too few periods for TimeSeriesSplit, this does NOT fall back to
     regular K-fold CV — standard K-fold (even with shuffle=False) can still let
     later time points influence hyperparameter choices for earlier ones, which is
-    a form of leakage for time-series data. Instead, it returns a conservative
-    fixed-alpha ElasticNet with no CV-based hyperparameter search.
+    a form of leakage for time-series data. It also does NOT treat a fixed-alpha
+    fallback as equivalent to cross-validated model selection: alpha=1.0 is an
+    arbitrary modelling choice, not a statistically defensible substitute for CV.
+    Instead, it returns a fixed-alpha ElasticNet explicitly labelled as exploratory
+    — callers must exclude exploratory-fallback results from Counterfactual
+    Reliability and from rolling-origin validation metrics used for method
+    comparison.
 
-    Returns: (model, cv_status) where cv_status is a short human-readable string
-    describing whether TimeSeriesSplit CV or the conservative fallback was used.
+    Returns: (model, cv_status, used_cv) where cv_status is a short human-readable
+    string describing whether TimeSeriesSplit CV or the exploratory fallback was
+    used, and used_cv is True only when TimeSeriesSplit-based ElasticNetCV was used.
     """
     tscv = safe_tscv(n_splits_pref, n_periods)
     if tscv is not None:
@@ -818,16 +769,19 @@ def build_regularized_model(method_name, n_periods, n_splits_pref=5, fixed_alpha
         else:  # lasso
             model = ElasticNetCV(l1_ratio=1, alphas=np.logspace(-4, 4, 100),
                                   cv=tscv, max_iter=10000, random_state=42)
-        return model, "TimeSeriesSplit cross-validation used to select regularisation strength."
-    # Too few pre-period observations for safe, leakage-free time-series CV.
+        return model, "TimeSeriesSplit cross-validation used to select regularisation strength.", True
+    # Too few pre-period observations for safe, leakage-free time-series CV. This
+    # fixed-alpha fit is exploratory only: it is NOT statistically equivalent to
+    # cross-validated model selection and must not feed Counterfactual Reliability
+    # or rolling-origin validation metrics used for method comparison.
     l1_ratio = 1.0 if method_name == "lasso" else 0.5
     model = ElasticNet(alpha=fixed_alpha, l1_ratio=l1_ratio, max_iter=10000, random_state=42)
     cv_status = (
-        f"Insufficient history for TimeSeriesSplit; used conservative fixed-alpha "
-        f"ElasticNet fallback (alpha={fixed_alpha}, l1_ratio={l1_ratio}) instead of "
-        f"cross-validated regularisation."
+        f"Insufficient history for TimeSeriesSplit; exploratory fixed-alpha ElasticNet "
+        f"fit (alpha={fixed_alpha}, l1_ratio={l1_ratio}) used instead — NOT cross-validated "
+        f"and excluded from Counterfactual Reliability."
     )
-    return model, cv_status
+    return model, cv_status, False
 
 def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=None, n_splits=5, model_type="enet",
                                min_training_weeks=None):
@@ -840,13 +794,17 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
 
     Uses TimeSeriesSplit-based cross-validation to tune model regularisation whenever a fold's
     training window has enough periods. Never falls back to regular K-fold CV, since that can leak
-    future information into hyperparameter tuning for time-series data; folds with too little
-    training history instead use a conservative fixed-alpha model (see build_regularized_model()).
+    future information into hyperparameter tuning for time-series data. Folds with too little
+    training history for TimeSeriesSplit instead fit an exploratory fixed-alpha model (see
+    build_regularized_model()) — those folds are excluded from rolling_smape_mean and
+    rolling_rmse_mean, since a fixed-alpha fit is not statistically equivalent to a
+    cross-validated result and should not be presented as such.
 
     Returns: fold_df (DataFrame, includes a "used_cv_fallback" column per fold), rolling_smape_mean
-    (float), rolling_rmse_mean (float), cv_status (str describing CV vs. fallback usage across folds).
-    For backwards compatibility, also accepts n_splits (ignored — all valid folds are used) and
-    min_training_weeks as an alias for min_training_periods.
+    (float, computed only from TimeSeriesSplit-CV folds — np.nan if none are available),
+    rolling_rmse_mean (float, same basis), cv_status (str describing CV vs. fallback usage across
+    folds). For backwards compatibility, also accepts n_splits (ignored — all valid folds are used)
+    and min_training_weeks as an alias for min_training_periods.
     """
     if min_training_weeks is not None:
         min_training_periods = min_training_weeks
@@ -880,8 +838,8 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
         if model_type not in ("enet", "lasso"):
             return empty_df, np.nan, np.nan, "Unsupported model_type"
 
-        model, fold_cv_status = build_regularized_model(model_type, len(train_y), n_splits_pref=3)
-        used_cv_fallback = model.__class__.__name__ != "ElasticNetCV"
+        model, fold_cv_status, fold_used_cv = build_regularized_model(model_type, len(train_y), n_splits_pref=3)
+        used_cv_fallback = not fold_used_cv
 
         model.fit(train_X_scaled, train_y)
         pred = model.predict(test_X_scaled)
@@ -929,21 +887,33 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
         return empty_df, np.nan, np.nan, "No folds: insufficient pre-period history for rolling-origin validation."
 
     fold_df = pd.DataFrame(folds)
-    rolling_smape_mean = float(fold_df["smape"].mean())
-    rolling_rmse_mean = float(fold_df["rmse"].mean())
     n_fallback_folds = int(fold_df["used_cv_fallback"].sum())
+    n_cv_folds = len(fold_df) - n_fallback_folds
+
+    # Exploratory fixed-alpha folds are NOT statistically equivalent to cross-validated
+    # results and must not feed the headline rolling-origin metrics used for method
+    # comparison or Counterfactual Reliability. Only TimeSeriesSplit-CV folds count here.
+    cv_fold_df = fold_df[~fold_df["used_cv_fallback"]]
+    if n_cv_folds > 0:
+        rolling_smape_mean = float(cv_fold_df["smape"].mean())
+        rolling_rmse_mean = float(cv_fold_df["rmse"].mean())
+    else:
+        rolling_smape_mean = np.nan
+        rolling_rmse_mean = np.nan
+
     if n_fallback_folds == 0:
         cv_status = "TimeSeriesSplit cross-validation used to select regularisation strength in all folds."
-    elif n_fallback_folds == len(fold_df):
+    elif n_cv_folds == 0:
         cv_status = (
-            "Insufficient history for TimeSeriesSplit in all folds; used conservative "
-            "fixed-alpha ElasticNet fallback instead of cross-validated regularisation."
+            "Insufficient history for TimeSeriesSplit in all folds; only exploratory fixed-alpha "
+            "fits were available, so rolling-origin validation metrics are Insufficient data "
+            "rather than being based on a non-cross-validated fallback."
         )
     else:
         cv_status = (
             f"Insufficient history for TimeSeriesSplit in {n_fallback_folds} of {len(fold_df)} folds; "
-            "those folds used a conservative fixed-alpha ElasticNet fallback instead of "
-            "cross-validated regularisation."
+            f"those folds were exploratory fixed-alpha fits and are excluded from rolling-origin "
+            f"validation metrics (based on the remaining {n_cv_folds} TimeSeriesSplit-CV fold(s))."
         )
     return fold_df, rolling_smape_mean, rolling_rmse_mean, cv_status
 
@@ -1065,8 +1035,8 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
 
     # Determine model type from method_name
     # method_name is either "enet" or "lasso"
-    model, main_model_cv_status = build_regularized_model(method_name, len(y_pre), n_splits_pref=5)
-    main_model_used_cv_fallback = model.__class__.__name__ != "ElasticNetCV"
+    model, main_model_cv_status, main_model_used_cv = build_regularized_model(method_name, len(y_pre), n_splits_pref=5)
+    main_model_used_cv_fallback = not main_model_used_cv
     model.fit(X_pre_scaled, y_pre)
     y_pred_pre = model.predict(X_pre_scaled)
     corr, r2, s, rmse = compute_metrics(y_pre, y_pred_pre)
@@ -1089,23 +1059,40 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     holdout_smape_mean = rolling_smape_mean
     holdout_rmse_mean = rolling_rmse_mean
 
-    # ---- CV status (item 6): never silently falls back to regular KFold for time-series
-    # data. Surface whether the main pre-period model and/or rolling-origin folds had to use
-    # the conservative fixed-alpha fallback because there wasn't enough history for TimeSeriesSplit.
+    # ---- CV status (item 6): never falls back to regular KFold for time-series data, and
+    # never treats a fixed-alpha fallback as equivalent to cross-validated model selection.
+    # If there isn't enough pre-period history for TimeSeriesSplit at all, rolling-origin
+    # folds are all exploratory fixed-alpha fits too (a fold's training window can never be
+    # longer than the full pre-period), so rolling_smape_mean/rolling_rmse_mean above are
+    # already np.nan in that case, and Counterfactual Reliability naturally reports
+    # "Insufficient data" rather than a misleading rating based on an arbitrary alpha.
     cv_status = f"Main model: {main_model_cv_status} Rolling-origin folds: {rolling_cv_status}"
-    if main_model_used_cv_fallback or (not fold_df.empty and bool(fold_df["used_cv_fallback"].any())):
+    if main_model_used_cv_fallback:
         st.warning(
-            "⚠️ Insufficient pre-period history for TimeSeriesSplit cross-validation in one or more "
-            f"models for **{method_name}**. A conservative fixed-alpha ElasticNet fallback was used "
-            "instead of regular K-fold CV, to avoid leaking future data into hyperparameter tuning. "
-            "Treat this method's results with extra caution."
+            f"⚠️ There is insufficient pre-period history to run leakage-free TimeSeriesSplit "
+            f"cross-validation for **{method_name}**. This method has not been given a "
+            "reliability rating. Add more pre-period data or reduce the validation window."
+        )
+    elif not fold_df.empty and bool(fold_df["used_cv_fallback"].any()):
+        _n_fallback_folds = int(fold_df["used_cv_fallback"].sum())
+        st.warning(
+            f"⚠️ {_n_fallback_folds} of {len(fold_df)} rolling-origin folds for **{method_name}** "
+            "did not have enough training history for leakage-free TimeSeriesSplit cross-validation. "
+            "Those folds were fit exploratorily with a fixed regularisation strength and are excluded "
+            "from the rolling-origin validation metrics and Counterfactual Reliability shown here."
         )
 
-    # Additional rolling-origin summary stats
+    # Additional rolling-origin summary stats. These also exclude exploratory fixed-alpha
+    # folds, since Rolling-Origin Bias (%) directly feeds Counterfactual Reliability and
+    # should not be contaminated by a non-cross-validated fit.
     if not fold_df.empty:
-        rolling_smape_p90 = float(np.percentile(fold_df["smape"], 90))
-        rolling_bias_pct_mean = float(fold_df["bias_pct"].mean())
-        valid_uplift_errs = fold_df["uplift_error_pct"].dropna()
+        cv_fold_df = fold_df[~fold_df["used_cv_fallback"]]
+    else:
+        cv_fold_df = fold_df
+    if not cv_fold_df.empty:
+        rolling_smape_p90 = float(np.percentile(cv_fold_df["smape"], 90))
+        rolling_bias_pct_mean = float(cv_fold_df["bias_pct"].mean())
+        valid_uplift_errs = cv_fold_df["uplift_error_pct"].dropna()
         rolling_uplift_error_pct_median = float(np.median(valid_uplift_errs)) if len(valid_uplift_errs) else np.nan
         if len(valid_uplift_errs) >= 2:
             rolling_uplift_error_pct_lower, rolling_uplift_error_pct_upper = np.percentile(valid_uplift_errs, [2.5, 97.5])
@@ -1117,11 +1104,13 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         rolling_smape_p90 = rolling_bias_pct_mean = np.nan
         rolling_uplift_error_pct_median = rolling_uplift_error_pct_lower = rolling_uplift_error_pct_upper = np.nan
 
-    # ---- Overfitting diagnostics (part 1): compare pre-period (in-sample) fit against
+    # ---- Generalisation Gap (part 1): compare pre-period (in-sample) fit against
     # rolling-origin (out-of-sample) accuracy. A large gap means the model looks good
-    # in-sample but doesn't hold up out-of-sample — a classic overfitting signature.
-    # n_pre_periods and the feature-density / risk classification are finalised further
-    # below, once the selected model features are known. ----
+    # in-sample but doesn't hold up out-of-sample when predicting held-out historical
+    # periods. This is a validation diagnostic, not a formal statistical test.
+    # n_pre_periods is used for pre-period observation counts; the reliability
+    # classification is finalised further below, once rolling-origin validation
+    # and residual diagnostics are known. ----
     n_pre_periods = len(y_pre)
     overfit_gap_smape = calculate_overfit_gap(s, rolling_smape_mean)
     overfit_gap_rmse = calculate_overfit_gap(rmse, rolling_rmse_mean)
@@ -1219,7 +1208,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
                     X_tr_scaled = scaler_p.fit_transform(X_tr)
                     # Use the same model type as main. Never falls back to regular KFold for
                     # time-series data — see build_regularized_model().
-                    model_p, _placebo_cv_status = build_regularized_model(method_name, len(y_tr), n_splits_pref=3)
+                    model_p, _placebo_cv_status, _placebo_used_cv = build_regularized_model(method_name, len(y_tr), n_splits_pref=3)
                     model_p.fit(X_tr_scaled, y_tr)
                     pred_p = model_p.predict(scaler_p.transform(X_te))
                     uplift_p = y_te.sum() - pred_p.sum()
@@ -1309,15 +1298,18 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     n_removed = n_candidates - n_selected
     alpha = getattr(model, "alpha_", np.nan)
 
-    # ---- Overfitting diagnostics (part 2): feature density uses the selected MODEL
-    # features (same-period + lagged terms counted separately if both are non-zero),
-    # not just the count of selected base regions. ----
+    # ---- Selected feature count, kept for transparency in the selected-controls
+    # table only. It is NOT used as a reliability diagnostic — reliability is
+    # based solely on validation performance and residual diagnostics (see
+    # classify_counterfactual_reliability() below). ----
     n_selected_features = len(selected_features)
-    feature_density = calculate_feature_density(n_selected_features, n_pre_periods)
-    overfitting_risk = classify_overfitting_risk(
-        overfit_gap_smape, feature_density, rolling_bias_pct_mean, rolling_smape_mean
+    autocorrelation_interpretation = classify_autocorrelation_interpretation(dw_stat)
+    counterfactual_reliability = classify_counterfactual_reliability(
+        overfit_gap_smape,
+        rolling_smape_mean=rolling_smape_mean,
+        rolling_bias_pct=rolling_bias_pct_mean,
+        autocorrelation_interpretation=autocorrelation_interpretation,
     )
-    autocorrelation_risk = classify_autocorrelation_risk(dw_stat)
 
     return {
         "dates_pre": dates_pre,
@@ -1328,7 +1320,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         "smape": s,
         "rmse": rmse,
         "dw_stat": dw_stat,
-        "autocorrelation_risk": autocorrelation_risk,
+        "autocorrelation_interpretation": autocorrelation_interpretation,
         "pre_residuals": pre_residuals,
         "holdout_smape_mean": holdout_smape_mean,
         "holdout_rmse_mean": holdout_rmse_mean,
@@ -1342,13 +1334,14 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         "rolling_uplift_error_pct_upper": rolling_uplift_error_pct_upper,
         "overfit_gap_smape": overfit_gap_smape,
         "overfit_gap_rmse": overfit_gap_rmse,
-        "feature_density": feature_density,
         "cv_status": cv_status,
         "used_cv_fallback": main_model_used_cv_fallback or (not fold_df.empty and bool(fold_df["used_cv_fallback"].any())),
+        "main_model_used_cv_fallback": main_model_used_cv_fallback,
         "n_selected_features": n_selected_features,
         "n_pre_periods": n_pre_periods,
         "n_pre_weeks": n_pre_periods,  # backward-compatible alias
-        "overfitting_risk": overfitting_risk,
+        "counterfactual_reliability": counterfactual_reliability,
+        "overfitting_risk": counterfactual_reliability,  # backward-compatible alias
         "min_training_periods": min_training_periods,
         "min_training_weeks": min_training_periods,  # backward-compatible alias
         "validation_window_periods": cv_horizon,
@@ -3116,7 +3109,7 @@ def render_time_series_validation(mode: str):
             "lag option if lagged controls are enabled.\n\n"
             "Daily analysis is useful when you need more granular monitoring, but weekly aggregation "
             "is usually more stable for final geo-test readouts. Daily results should be judged "
-            "carefully using rolling-origin validation, placebo ranges and overfitting diagnostics."
+            "carefully using rolling-origin validation, placebo ranges and model validation diagnostics."
         )
 
     # Frequency inference uses the SELECTED METRIC's own dates (not the whole file), since
@@ -3901,35 +3894,13 @@ def render_time_series_validation(mode: str):
                         f"Check whether your daily data has gaps."
                     )
 
-            # ---- Feature-density / overfitting risk visibility (item 6) ----
-            _fd = res.get("feature_density", np.nan)
-            _n_sel_feat = res.get("n_selected_features", None)
-            _n_pre_per = res.get("n_pre_periods", res.get("n_pre_weeks", None))
-            if _fd is not None and not (isinstance(_fd, float) and np.isnan(_fd)) and _n_sel_feat is not None and _n_pre_per is not None:
-                _fd_display = format_feature_density(_n_sel_feat, _n_pre_per, _fd)
-                _fd_period_word = vres_freq_config['period_label_plural']
-                if _fd > 0.50:
-                    st.error(
-                        f"High model reliability risk: the selected model uses {_n_sel_feat} features across "
-                        f"{_n_pre_per} pre-period {_fd_period_word} (feature density = {_fd_display}). "
-                        "This means the model has many predictors relative to the number of historical time "
-                        "points, so it may fit coincidental patterns and produce an unstable uplift estimate."
-                    )
-                elif _fd > 0.30:
-                    st.warning(
-                        f"Moderate model reliability risk: the selected model uses {_n_sel_feat} features across "
-                        f"{_n_pre_per} pre-period {_fd_period_word} (feature density = {_fd_display}). "
-                        "The model has a relatively high number of predictors for the available pre-period "
-                        "history. Review rolling-origin and placebo diagnostics before trusting the result."
-                    )
-
-            # ---- High validation error, even when the overfit gap is small (item 13) ----
+            # ---- High validation error, even when the generalisation gap is small (item 13) ----
             _rolling_smape_mean = res.get("rolling_smape_mean", res.get("holdout_smape_mean", np.nan))
             if _rolling_smape_mean is not None and not (isinstance(_rolling_smape_mean, float) and np.isnan(_rolling_smape_mean)):
                 if _rolling_smape_mean > 30:
                     st.error(
                         f"High validation error: rolling-origin sMAPE is {_rolling_smape_mean:.1f}%. "
-                        "Even if the overfit gap is small, the model is not predicting the test group accurately enough to support a reliable uplift estimate."
+                        "Even if the Generalisation Gap is small, the model is not predicting the test group accurately enough to support a reliable uplift estimate."
                     )
                 elif _rolling_smape_mean > 20:
                     st.warning(
@@ -4103,14 +4074,12 @@ def render_time_series_validation(mode: str):
         # ---- Method Comparison table ----
         st.subheader("Method Comparison")
 
-        RISK_LABELS = {
-            "Low": "🟢 Low",
-            "Moderate": "🟡 Moderate",
-            "High": "🔴 High",
+        RELIABILITY_LABELS = {
+            "Strong": "🟢 Strong",
+            "Caution": "🟠 Caution",
+            "Weak": "🔴 Weak",
             "Insufficient data": "⚪ Insufficient data",
         }
-
-        FEATURE_DENSITY_LABEL = f"Feature Density (selected features / pre-period {vres_freq_config['period_label_plural']})"
 
         comparison_rows = [
             {"Metric": "A. CONTROL SELECTION", "is_section": True},
@@ -4126,7 +4095,7 @@ def render_time_series_validation(mode: str):
 
             {"Metric": "C. RESIDUAL DIAGNOSTICS", "is_section": True},
             {"Metric": "Durbin-Watson", "key": "dw_stat"},
-            {"Metric": "Residual Autocorrelation Risk", "key": "autocorrelation_risk"},
+            {"Metric": "Residual Autocorrelation Interpretation", "key": "autocorrelation_interpretation"},
 
             {"Metric": "D. ROLLING-ORIGIN VALIDATION", "is_section": True},
             {"Metric": "CV Method", "key": "cv_status_short"},
@@ -4135,11 +4104,10 @@ def render_time_series_validation(mode: str):
             {"Metric": "Rolling-Origin RMSE", "key": "holdout_rmse"},
             {"Metric": "Rolling-Origin Bias (%)", "key": "rolling_bias_pct_mean"},
 
-            {"Metric": "E. OVERFITTING DIAGNOSTICS", "is_section": True},
-            {"Metric": "Overfit Gap, sMAPE percentage points", "key": "overfit_gap_smape"},
-            {"Metric": "Overfit Gap RMSE", "key": "overfit_gap_rmse"},
-            {"Metric": FEATURE_DENSITY_LABEL, "key": "feature_density"},
-            {"Metric": "Overfitting / Reliability Risk", "key": "overfitting_risk"},
+            {"Metric": "E. MODEL VALIDATION DIAGNOSTICS", "is_section": True},
+            {"Metric": "Generalisation Gap, sMAPE percentage points", "key": "overfit_gap_smape"},
+            {"Metric": "Generalisation Gap RMSE", "key": "overfit_gap_rmse"},
+            {"Metric": "Counterfactual Reliability", "key": "counterfactual_reliability"},
 
             {"Metric": "F. PLACEBO TESTING", "is_section": True},
             {"Metric": "Placebo Windows Run", "key": "placebo_windows"},
@@ -4187,7 +4155,12 @@ def render_time_series_validation(mode: str):
                 v = res.get("n_selected_features", None)
                 return str(v) if v is not None else "N/A"
             elif key == "cv_status_short":
-                return "🟠 Fixed-alpha fallback (some/all folds)" if res.get("used_cv_fallback") else "🟢 TimeSeriesSplit CV"
+                if res.get("main_model_used_cv_fallback"):
+                    return "⚪ Insufficient data for CV (no reliability rating)"
+                elif res.get("used_cv_fallback"):
+                    return "🟠 TimeSeriesSplit CV (some folds excluded)"
+                else:
+                    return "🟢 TimeSeriesSplit CV"
             elif key == "pre_corr":
                 return _fmt_num(res.get('corr', np.nan), decimals=3)
             elif key == "pre_r2":
@@ -4201,9 +4174,9 @@ def render_time_series_validation(mode: str):
                 if dw is None or (isinstance(dw, float) and np.isnan(dw)):
                     return "N/A"
                 return f"{dw:.2f}"
-            elif key == "autocorrelation_risk":
-                risk = res.get("autocorrelation_risk", None)
-                return risk if risk else "N/A"
+            elif key == "autocorrelation_interpretation":
+                interpretation = res.get("autocorrelation_interpretation", None)
+                return interpretation if interpretation else "N/A"
             elif key == "holdout_smape":
                 return _fmt_pct(res.get('holdout_smape_mean', np.nan))
             elif key == "holdout_rmse":
@@ -4217,14 +4190,9 @@ def render_time_series_validation(mode: str):
                 return f"{v:.1f} pp" if not (v is None or (isinstance(v, float) and np.isnan(v))) else "N/A"
             elif key == "overfit_gap_rmse":
                 return _fmt_num(res.get("overfit_gap_rmse", np.nan))
-            elif key == "feature_density":
-                density = res.get("feature_density", np.nan)
-                n_feat = res.get("n_selected_features", None)
-                n_periods = res.get("n_pre_periods", res.get("n_pre_weeks", None))
-                return format_feature_density(n_feat, n_periods, density)
-            elif key == "overfitting_risk":
-                risk = res.get("overfitting_risk", None)
-                return RISK_LABELS.get(risk, "N/A")
+            elif key == "counterfactual_reliability":
+                reliability = res.get("counterfactual_reliability", None)
+                return RELIABILITY_LABELS.get(reliability, "N/A")
             elif key == "placebo_windows":
                 return str(len(res['placebos']))
             elif key == "median_placebo_uplift_pct":
@@ -4281,23 +4249,17 @@ def render_time_series_validation(mode: str):
         st.dataframe(styled_comp, width='stretch', hide_index=False)
 
         st.caption(
-            "Durbin-Watson checks whether residuals are time-patterned. Values near 2 suggest little "
-            "autocorrelation. Values materially below 2 suggest positive autocorrelation, meaning the model "
-            "may be missing time structure and uncertainty may be understated."
+            "Durbin-Watson is an established statistic for first-order residual autocorrelation. Values near 2 "
+            "suggest little autocorrelation; values materially below 2 suggest positive autocorrelation; values "
+            "materially above 2 suggest negative autocorrelation. The traffic-light label is an interpretation "
+            "band, not a formal critical-value test."
         )
         st.caption(
-            f"**{FEATURE_DENSITY_LABEL}** shows how many model features are being estimated relative to the "
-            f"number of pre-period {vres_freq_config['period_label_plural']}. Higher values mean the model has "
-            "more flexibility relative to the amount of historical evidence, which can increase the risk of "
-            "fitting coincidental patterns or unstable uplift estimates."
-        )
-        st.caption(
-            "**Overfitting / Reliability Risk** is higher when a method fits the pre-period very well but performs much worse in "
-            f"rolling-origin validation (overfit gap), when the rolling-origin validation error itself is high even if the "
-            f"gap is small, or when it uses many selected features relative to the number of "
-            f"pre-period {vres_freq_config['period_label_plural']}. This is especially important for data-optimised "
-            "methods because they search across many possible controls and can find coincidental historical relationships. "
-            "A small overfit gap is only reassuring if the rolling validation error itself is also acceptable."
+            "**Counterfactual Reliability** summarises whether the control model appears reliable enough to support "
+            "a counterfactual estimate. It is based primarily on rolling-origin validation performance, then "
+            "downgraded where there is evidence of poor generalisation, systematic validation bias, or residual "
+            "autocorrelation. The traffic-light label is an interpretation aid based on validation diagnostics, "
+            "not a standalone statistical test."
         )
         st.caption(
             "⚪ **Insufficient data** means there were not enough rolling-origin validation windows to assess "
@@ -4320,9 +4282,9 @@ The goal here is to assess whether your control group can reliably predict what 
 
 ---
 
-**Step 1 — Start with Rolling-Origin Validation (the primary signal)**
+**Step 1 — Start with Rolling-Origin Validation**
 
-These metrics test the model on historical data it has never seen, making them far more trustworthy than pre-period fit.
+This checks whether the model can predict held-out historical periods using only earlier data. It is the main evidence that the counterfactual model generalises, and is far more trustworthy than pre-period fit alone.
 
 - **Rolling-Origin sMAPE (%)** — Typical percentage error when predicting the test KPI from controls. Aim for below 10%. Above 20% suggests the control group is a poor predictor.
 - **Rolling-Origin sMAPE — Worst Case (P90)** — The error in the weakest 10% of forecast windows. Even if the average looks fine, a high P90 means the model breaks down in certain periods.
@@ -4330,14 +4292,13 @@ These metrics test the model on historical data it has never seen, making them f
 
 ---
 
-**Step 2 — Check Overfitting Diagnostics**
+**Step 2 — Check Model Validation Diagnostics**
 
 A method can look excellent in-sample and still be unreliable if it's fitting coincidental historical patterns rather than a genuine relationship.
 
-- **Overfit Gap, sMAPE percentage points** — How much worse the model performs out-of-sample versus in-sample. A large positive gap (roughly above 3–8 percentage points) suggests the pre-period fit is flattering and won't hold up.
-- **{FEATURE_DENSITY_LABEL}** — How many model features, including lagged terms, are being fit relative to how many pre-period {vres_freq_config['period_label_plural']} are available. A high ratio, roughly above 0.30–0.50, means the model may have too much flexibility for the amount of historical evidence available.
-- **Residual Autocorrelation Risk** — Interprets the Durbin-Watson statistic on a traffic-light scale. Values near 2 mean low autocorrelation; values materially below 2 flag positive autocorrelation, meaning the model may be missing time structure.
-- **Overfitting / Reliability Risk** — A Low / Moderate / High summary combining the overfit gap, the *absolute* level of rolling-origin validation error (a small gap is not reassuring if rolling-origin sMAPE itself is high), feature density, and rolling bias. Treat "High" results with real caution, especially for data-optimised methods. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess this — this is a data-availability gap, not evidence that risk is low.
+- **Generalisation Gap, sMAPE percentage points** — Compares in-sample pre-period fit with rolling-origin validation performance. A large positive gap (roughly above 3–8 percentage points) means the model performs worse when predicting held-out historical periods than it does when fitted on the full pre-period, so the pre-period fit is flattering and won't hold up. This is a validation diagnostic, not a formal statistical test.
+- **Residual Autocorrelation Interpretation** — Durbin-Watson is an established statistic for first-order residual autocorrelation. Values near 2 suggest little autocorrelation; values materially below 2 suggest positive autocorrelation; values materially above 2 suggest negative autocorrelation. The traffic-light label is an interpretation band, not a formal critical-value test.
+- **Counterfactual Reliability** — Summarises this validation evidence and downgrades the rating if the model has a large Generalisation Gap, systematic rolling-origin bias, or residual autocorrelation. Treat "Weak" results with real caution, especially for data-optimised methods. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess this — this is a data-availability gap, not evidence that reliability is strong. The traffic-light label is an interpretation aid based on validation diagnostics, not a standalone statistical test.
 
 ---
 
@@ -4354,11 +4315,11 @@ Placebo tests simulate running a fake intervention across all available historic
 
 Pre-period Correlation is shown for reference but can be misleadingly high — a model can fit the pre-period well and still fail out-of-sample. Always weight the rolling-origin metrics more heavily.
 
-**Durbin-Watson** checks whether the model's pre-period residuals are autocorrelated. It is around 2.0 when residuals have little autocorrelation; values below 2 suggest positive autocorrelation, values above 2 suggest negative autocorrelation. Strong autocorrelation is a sign the model is missing structure in the data (e.g. trends or delayed effects) that the standard errors don't account for.
+**Durbin-Watson** is an established statistic for first-order residual autocorrelation in the model's pre-period residuals. It is around 2.0 when residuals have little autocorrelation; values below 2 suggest positive autocorrelation, values above 2 suggest negative autocorrelation. Strong autocorrelation is a sign the model is missing structure in the data (e.g. trends or delayed effects) that the standard errors don't account for.
 
 ---
 
-**Rule of thumb:** Low rolling-origin sMAPE + Low/Moderate Overfitting / Reliability Risk + a narrow, tight placebo distribution = a reliable test design ready to run.
+**Rule of thumb:** Low rolling-origin sMAPE + Strong/Caution Counterfactual Reliability + a narrow, tight placebo distribution = a reliable test design ready to run.
                 """)
             else:
                 st.markdown("""
@@ -4370,9 +4331,11 @@ Before trusting the uplift estimate, verify the model can reliably predict the t
 
 **Step 1 — Verify the model is trustworthy**
 
+Start with Rolling-Origin Validation. This checks whether the model can predict held-out historical periods using only earlier data. It is the main evidence that the counterfactual model generalises.
+
 - **Rolling-Origin sMAPE (%)** — Typical out-of-sample prediction error. If this is above 15–20%, treat the uplift estimate with caution — the counterfactual baseline is uncertain.
 - **Rolling-Origin Bias (%)** — Persistent bias in the model's predictions. A model that consistently undershoots will overstate uplift, and vice versa.
-- **Overfitting / Reliability Risk** — If this is "High", the pre-period fit may be flattering and not representative of genuine predictive ability, or the rolling-origin validation error itself is too high to trust — treat the uplift number with extra caution, particularly for data-optimised methods. If it shows "Insufficient data", there wasn't enough rolling-origin history to assess this at all — treat the uplift with the same caution you would give a "High" result.
+- **Counterfactual Reliability** — Summarises this validation evidence and downgrades the rating if the model has a large Generalisation Gap, systematic rolling-origin bias, or residual autocorrelation. If this is "Weak", treat the uplift number with extra caution, particularly for data-optimised methods. If it shows "Insufficient data", there wasn't enough rolling-origin history to assess this at all — treat the uplift with the same caution you would give a "Weak" result. The traffic-light label is an interpretation aid, not a formal statistical test.
 - **Placebo Uplift Range (95%)** — The range of apparent uplifts the model detects in historical periods with no intervention. Your observed uplift needs to sit clearly outside this range.
 
 ---
@@ -4380,17 +4343,17 @@ Before trusting the uplift estimate, verify the model can reliably predict the t
 **Step 2 — Assess the uplift result**
 
 - **Observed Uplift Percentile vs Placebos** — Where your observed uplift ranks relative to the distribution of historical placebo (fake-test) uplifts. 95th percentile or above is stronger evidence that the observed uplift is unusual relative to pre-period noise.
-- **Observed Uplift p-value** — An approximate, non-parametric extremeness check: how unusual the observed uplift looks against the placebo distribution. This is evidence consistent with an effect, not proof of statistical significance. Below 0.05 is the conventional (approximate) threshold analysts use as a rule of thumb.
+- **Observed Uplift p-value** — The placebo p-value is an empirical extremeness check: it shows how unusual the observed uplift is relative to historical fake-test windows. It is not proof of causality and should be interpreted alongside model fit, rolling-origin validation, and business context. Below 0.05 is the conventional (approximate) threshold analysts use as a rule of thumb.
 
 ---
 
 **Step 3 — Compare methods**
 
-If you ran multiple methods (Structural, Data-Optimised), look for agreement. When both methods produce similar uplift estimates, both show good out-of-sample fit, and both show Low/Moderate Overfitting / Reliability Risk, confidence in the result is higher.
+If you ran multiple methods (Structural, Data-Optimised), look for agreement. When both methods produce similar uplift estimates, both show good out-of-sample fit, and both show Strong/Caution Counterfactual Reliability, confidence in the result is higher.
 
 ---
 
-**Rule of thumb:** Low rolling-origin sMAPE + Low/Moderate Overfitting / Reliability Risk + observed uplift outside the placebo range + a small p-value = a result with stronger evidence behind it, though still not proof of causality on its own.
+**Rule of thumb:** Low rolling-origin sMAPE + Strong/Caution Counterfactual Reliability + observed uplift outside the placebo range + a small p-value = a result with stronger evidence behind it, though still not proof of causality on its own.
                 """)
 
 
