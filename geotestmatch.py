@@ -290,11 +290,11 @@ def classify_autocorrelation_risk(dw_stat):
     if 1.7 <= dw <= 2.3:
         return "🟢 Low autocorrelation"
     elif 1.3 <= dw < 1.7:
-        return "🟡 Moderate positive autocorrelation"
+        return "🟠 Positive autocorrelation"
     elif dw < 1.3:
         return "🔴 High positive autocorrelation"
     elif 2.3 < dw <= 2.7:
-        return "🟡 Moderate negative autocorrelation"
+        return "🟠 Negative autocorrelation"
     else:
         return "🔴 High negative autocorrelation"
 
@@ -341,6 +341,23 @@ def calculate_feature_density(n_selected_features, n_pre_periods):
     if isinstance(n_selected_features, float) and np.isnan(n_selected_features):
         return np.nan
     return n_selected_features / n_pre_periods
+
+def format_feature_density(n_selected_features, n_pre_periods, feature_density):
+    """
+    Formats Feature Density consistently everywhere it is displayed, as a ratio
+    followed by its decimal value, e.g. "4 / 12 = 0.33". Never formats Feature
+    Density as a percentage.
+    Returns "N/A" if any input is missing or not a finite number.
+    """
+    if (
+        n_selected_features is None
+        or n_pre_periods is None
+        or feature_density is None
+        or pd.isna(feature_density)
+        or not np.isfinite(float(feature_density))
+    ):
+        return "N/A"
+    return f"{int(n_selected_features)} / {int(n_pre_periods)} = {float(feature_density):.2f}"
 
 def classify_overfitting_risk(overfit_gap_smape, feature_density, rolling_bias_pct=None, rolling_smape_mean=None):
     """
@@ -3373,7 +3390,7 @@ def render_time_series_validation(mode: str):
     if freq_config["frequency"] == "daily" and not include_lagged_controls:
         st.info(
             "ℹ️ Daily data often has strong day-of-week effects. The 7-day lag option can help compare the "
-            "same day of week, but it also increases feature count and overfitting risk. Use rolling-origin "
+            "same day of week, but it also increases feature count and model reliability risk. Use rolling-origin "
             "validation to decide whether it improves the model."
         )
 
@@ -3423,13 +3440,13 @@ def render_time_series_validation(mode: str):
         if hist_periods < 84:
             st.warning(
                 "⚠️ Daily data with fewer than around 12 weeks of pre-period history may produce unstable "
-                "validation and placebo results. Treat overfitting risk, rolling-origin metrics and placebo "
+                "validation and placebo results. Treat model reliability risk, rolling-origin metrics and placebo "
                 "ranges with caution."
             )
         elif _est_folds < 5:
             st.warning(
                 "⚠️ With the current minimum training period and window length, rolling-origin validation is "
-                "likely to produce very few folds. Treat overfitting risk, rolling-origin metrics and placebo "
+                "likely to produce very few folds. Treat model reliability risk, rolling-origin metrics and placebo "
                 "ranges with caution, or consider a longer pre-period / shorter window."
             )
 
@@ -3830,16 +3847,17 @@ def render_time_series_validation(mode: str):
             _n_sel_feat = res.get("n_selected_features", None)
             _n_pre_per = res.get("n_pre_periods", res.get("n_pre_weeks", None))
             if _fd is not None and not (isinstance(_fd, float) and np.isnan(_fd)) and _n_sel_feat is not None and _n_pre_per is not None:
+                _fd_display = format_feature_density(_n_sel_feat, _n_pre_per, _fd)
                 if _fd > 0.50:
                     st.error(
-                        f"High overfitting risk: the selected model uses {_n_sel_feat} features across "
-                        f"{_n_pre_per} pre-period observations (feature density = {_fd:.2f}). "
+                        f"High model reliability risk: the selected model uses {_n_sel_feat} features across "
+                        f"{_n_pre_per} pre-period observations (feature density = {_fd_display}). "
                         "This means there is little historical data per model feature, so the uplift estimate may be unstable."
                     )
                 elif _fd > 0.30:
                     st.warning(
-                        f"Moderate overfitting risk: the selected model uses {_n_sel_feat} features across "
-                        f"{_n_pre_per} pre-period observations (feature density = {_fd:.2f}). "
+                        f"Moderate model reliability risk: the selected model uses {_n_sel_feat} features across "
+                        f"{_n_pre_per} pre-period observations (feature density = {_fd_display}). "
                         "Review rolling-origin and placebo diagnostics before trusting the result."
                     )
 
@@ -4138,9 +4156,7 @@ def render_time_series_validation(mode: str):
                 density = res.get("feature_density", np.nan)
                 n_feat = res.get("n_selected_features", None)
                 n_periods = res.get("n_pre_periods", res.get("n_pre_weeks", None))
-                if density is None or (isinstance(density, float) and np.isnan(density)) or n_feat is None or n_periods is None:
-                    return "N/A"
-                return f"{n_feat} / {n_periods} ({density * 100:.1f}%)"
+                return format_feature_density(n_feat, n_periods, density)
             elif key == "overfitting_risk":
                 risk = res.get("overfitting_risk", None)
                 return RISK_LABELS.get(risk, "N/A")
@@ -4276,7 +4292,7 @@ Pre-period Correlation is shown for reference but can be misleadingly high — a
 
 ---
 
-**Rule of thumb:** Low rolling-origin sMAPE + Low/Moderate overfitting risk + a narrow, tight placebo distribution = a reliable test design ready to run.
+**Rule of thumb:** Low rolling-origin sMAPE + Low/Moderate Overfitting / Reliability Risk + a narrow, tight placebo distribution = a reliable test design ready to run.
                 """)
             else:
                 st.markdown("""
@@ -4304,11 +4320,11 @@ Before trusting the uplift estimate, verify the model can reliably predict the t
 
 **Step 3 — Compare methods**
 
-If you ran multiple methods (Structural, Data-Optimised), look for agreement. When both methods produce similar uplift estimates, both show good out-of-sample fit, and both show Low/Moderate overfitting risk, confidence in the result is higher.
+If you ran multiple methods (Structural, Data-Optimised), look for agreement. When both methods produce similar uplift estimates, both show good out-of-sample fit, and both show Low/Moderate Overfitting / Reliability Risk, confidence in the result is higher.
 
 ---
 
-**Rule of thumb:** Low rolling-origin sMAPE + Low/Moderate overfitting risk + observed uplift outside the placebo range + a small p-value = a result with stronger evidence behind it, though still not proof of causality on its own.
+**Rule of thumb:** Low rolling-origin sMAPE + Low/Moderate Overfitting / Reliability Risk + observed uplift outside the placebo range + a small p-value = a result with stronger evidence behind it, though still not proof of causality on its own.
                 """)
 
 
