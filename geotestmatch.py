@@ -418,12 +418,12 @@ def combine_reliability_ratings(component_ratings):
     """
     symbols = [v.split(" ", 1)[0] for v in component_ratings.values() if v]
     if any(s == "🔴" for s in symbols):
-        return "❌ Weak"
+        return "Weak"
     if any(s == "🟡" for s in symbols):
-        return "⚠️ Caution"
+        return "Caution"
     available = [s for s in symbols if s != "⚪"]
     if available and all(s == "🟢" for s in available):
-        return "✅ Strong"
+        return "Strong"
     return "Insufficient data"
 
 def get_reliability_drivers(component_ratings):
