@@ -3155,7 +3155,7 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         {"Metric": "Bias Risk", "key": "rolling_bias_risk"},
 
         {"Metric": "D. OVERFITTING CHECK", "is_section": True},
-        {"Metric": "Pre-Period vs Validation sMAPE Gap (pp)", "key": "overfit_gap_smape"},
+        {"Metric": "Pre-Period vs Validation sMAPE Difference (pp)", "key": "overfit_gap_smape"},
         {"Metric": "Overfitting Risk", "key": "overfitting_risk"},
 
         {"Metric": "E. RESIDUAL DIAGNOSTICS", "is_section": True},
@@ -3308,22 +3308,28 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
     styled_comp = comp_df_val.style.apply(style_section_rows, axis=1)
     st.dataframe(styled_comp, width='stretch', hide_index=False)
 
+
+    st.caption(
+        "**Rolling-Origin Validation Error** shows whether the model can predict held-out historical periods. "
+        "Lower is better."
+    )
+    st.caption(
+        "**Rolling-Origin Validation Bias** checks whether the model systematically over- or under-predicts in held-out "
+        "historical periods."
+    )
+    st.caption(
+        "**Pre-Period vs Validation sMAPE Difference** compares the model's in-sample pre-period error with its held-out rolling "
+        "validation error. A large positive gap means the model looks good on the data it was fitted on, "
+        "but performs worse when predicting unseen historical periods."
+    )
     st.caption(
         "**Durbin-Watson** checks whether residuals are autocorrelated. Values near 2 are good. Values far "
         "below or above 2 suggest the model is missing time patterns."
     )
     st.caption(
-        "**Overfitting Gap** compares the model's in-sample pre-period error with its held-out rolling "
-        "validation error. A large positive gap means the model looks good on the data it was fitted on, "
-        "but performs worse when predicting unseen historical periods."
-    )
-    st.caption(
-        "**Rolling Validation Error** shows whether the model can predict held-out historical periods. "
-        "Lower is better."
-    )
-    st.caption(
-        "**Rolling Bias** checks whether the model systematically over- or under-predicts in held-out "
-        "historical periods."
+        "**95% Placebo Uplift Range** is based on historical fake-test windows. They show how much apparent "
+        "uplift could occur when no real intervention happened. If the observed test uplift sits inside "
+        "this range, it may not be distinguishable from normal historical noise."
     )
     st.caption(
         "**Counterfactual Reliability** is the overall traffic-light summary. It takes the worst result "
@@ -3334,17 +3340,6 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         "**Reliability Drivers** explains which check(s) drove the rating. "
         "Traffic-light bands are interpretation aids based on validation diagnostics — they are not "
         "standalone hypothesis tests."
-    )
-    st.caption(
-        "⚪ **Insufficient data** means there were not enough rolling-origin validation windows to assess "
-        "whether the model generalises out-of-sample. Treat this with caution, especially for "
-        "completed-test evaluation."
-    )
-    st.caption(
-        "Placebo uplift ranges are based on historical fake-test windows. They show how much apparent "
-        "uplift could occur when no real intervention happened. If the observed test uplift sits inside "
-        "this range, it may not be distinguishable from normal historical noise. Placebo testing is a "
-        "separate robustness check and is not folded into Counterfactual Reliability."
     )
 
     # ---- Interpretation help ----
