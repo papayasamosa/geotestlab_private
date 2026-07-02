@@ -442,13 +442,13 @@ def get_reliability_drivers(component_ratings):
     if overall == "Weak":
         drivers = [k for k, s in symbols.items() if s == "🔴"]
         detail = " + ".join(f"high {k}" for k in drivers) if drivers else "validation checks failed"
-        return f"🔴 Weak: {detail}"
+        return f"{detail[:1].upper()}{detail[1:].lower()}"
     if overall == "Caution":
         drivers = [k for k, s in symbols.items() if s == "🟡"]
         detail = " + ".join(f"moderate {k}" for k in drivers) if drivers else "elevated validation risk"
-        return f"🟡 Caution: {detail}"
+        return f"{detail[:1].upper()}{detail[1:].lower()}"
     if overall == "Strong":
-        return "🟢 Strong: validation checks passed"
+        return "Validation checks passed"
     return "⚪ Insufficient data: rolling validation unavailable"
 
 # ------------------------------------------------------------
