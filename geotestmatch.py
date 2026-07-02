@@ -4400,7 +4400,7 @@ def render_time_series_validation(mode: str):
                         "Review the fit chart, residual diagnostics, and placebo results before relying on this method."
                     )
 
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3 = st.columns(3)
             col1.metric(
                 "Pre-Period Correlation",
                 f"{res['corr']:.3f}",
@@ -4415,11 +4415,6 @@ def render_time_series_validation(mode: str):
                 "Pre-Period sMAPE",
                 f"{res['smape']:.1f}%",
                 help="Average percentage error in pre‑period predictions (in‑sample). Lower is better."
-            )
-            col4.metric(
-                "Pre-Period RMSE",
-                f"{res['rmse']:.0f}",
-                help="Typical error in pre‑period predictions (in‑sample) in the same units as the KPI."
             )
 
             if compute_uplift and test_start is not None and test_end is not None and res['uplift'] is not None:
@@ -5034,15 +5029,13 @@ with tab4:
             bayes = st.session_state.bayesian_results
 
             # Row 1: Pre-period fit metrics
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3 = st.columns(3)
             col1.metric("Pre-Period Correlation", f"{bayes['corr']:.3f}",
                 help="How closely the Bayesian counterfactual fits the actual pre-period KPI.")
             col2.metric("Pre-Period R²", f"{bayes['r2']:.3f}",
                 help="Proportion of variation in the test KPI explained by the controls (pre-period).")
             col3.metric("Pre-Period sMAPE", f"{bayes['smape']:.1f}%",
                 help="Average percentage error of the Bayesian model in the pre-period.")
-            col4.metric("Pre-Period RMSE", f"{bayes['rmse']:.0f}",
-                help="Typical absolute error of the Bayesian model in the pre-period.")
 
             # Row 2: Uplift results
             uplift_label = f"{bayes['mean_uplift']:.0f}"
