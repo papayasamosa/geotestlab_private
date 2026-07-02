@@ -61,8 +61,8 @@ CONFIG = {
     # classify_autocorrelation_risk().
     "reliability_thresholds": {
         "durbin_watson_low_band": (1.7, 2.3),          # 🟢 Low
-        "durbin_watson_moderate_low_band": (1.3, 1.7),  # 🟠 Moderate (positive autocorrelation side)
-        "durbin_watson_moderate_high_band": (2.3, 2.7), # 🟠 Moderate (negative autocorrelation side)
+        "durbin_watson_moderate_low_band": (1.3, 1.7),  # 🟡 Moderate (positive autocorrelation side)
+        "durbin_watson_moderate_high_band": (2.3, 2.7), # 🟡 Moderate (negative autocorrelation side)
         "overfitting_gap_pp": {"low_max": 3, "moderate_max": 8},
         "rolling_smape_pct": {"low_max": 20, "moderate_max": 30},
         "rolling_bias_pct": {"low_max": 5, "moderate_max": 10},
@@ -323,7 +323,7 @@ def classify_autocorrelation_risk(dw_stat):
     if _low_lo <= dw <= _low_hi:
         return "🟢 Low"
     elif (_mod_lo_lo <= dw < _mod_lo_hi) or (_mod_hi_lo < dw <= _mod_hi_hi):
-        return "🟠 Moderate"
+        return "🟡 Moderate"
     else:
         return "🔴 High"
 
@@ -358,7 +358,7 @@ def classify_overfitting_risk(overfit_gap_smape):
     if overfit_gap_smape <= _t["low_max"]:
         return "🟢 Low"
     if overfit_gap_smape <= _t["moderate_max"]:
-        return "🟠 Moderate"
+        return "🟡 Moderate"
     return "🔴 High"
 
 def classify_rolling_validation_error(rolling_smape_mean):
@@ -376,7 +376,7 @@ def classify_rolling_validation_error(rolling_smape_mean):
     if rolling_smape_mean <= _t["low_max"]:
         return "🟢 Low"
     if rolling_smape_mean <= _t["moderate_max"]:
-        return "🟠 Moderate"
+        return "🟡 Moderate"
     return "🔴 High"
 
 def classify_rolling_bias_risk(rolling_bias_pct):
@@ -391,7 +391,7 @@ def classify_rolling_bias_risk(rolling_bias_pct):
     if abs(rolling_bias_pct) <= _t["low_max"]:
         return "🟢 Low"
     if abs(rolling_bias_pct) <= _t["moderate_max"]:
-        return "🟠 Moderate"
+        return "🟡 Moderate"
     return "🔴 High"
 
 def combine_reliability_ratings(component_ratings):
@@ -400,14 +400,14 @@ def combine_reliability_ratings(component_ratings):
     Insufficient data) from a dict of component traffic-light ratings, e.g.:
         {
             "rolling validation error": "🟢 Low",
-            "overfitting gap": "🟠 Moderate",
+            "overfitting gap": "🟡 Moderate",
             "rolling bias": "🟢 Low",
             "autocorrelation risk": "⚪ Insufficient data",
         }
 
     Rule: take the WORST available component.
     - Any component 🔴  -> "Weak"
-    - Else any component 🟠  -> "Caution"
+    - Else any component 🟡  -> "Caution"
     - Else, if at least one component is available (not ⚪) and all available
       components are 🟢  -> "Strong"
     - Otherwise (no components available at all) -> "Insufficient data"
@@ -419,7 +419,7 @@ def combine_reliability_ratings(component_ratings):
     symbols = [v.split(" ", 1)[0] for v in component_ratings.values() if v]
     if any(s == "🔴" for s in symbols):
         return "Weak"
-    if any(s == "🟠" for s in symbols):
+    if any(s == "🟡" for s in symbols):
         return "Caution"
     available = [s for s in symbols if s != "⚪"]
     if available and all(s == "🟢" for s in available):
@@ -429,7 +429,7 @@ def combine_reliability_ratings(component_ratings):
 def get_reliability_drivers(component_ratings):
     """
     Produces a short, human-readable explanation of what drove the Counterfactual
-    Reliability rating, e.g. "🟠 Caution: moderate overfitting gap" or
+    Reliability rating, e.g. "🟡 Caution: moderate overfitting gap" or
     "🔴 Weak: high rolling validation error + high autocorrelation risk".
 
     component_ratings: dict of {short driver label: traffic-light string}, using the
@@ -444,9 +444,9 @@ def get_reliability_drivers(component_ratings):
         detail = " + ".join(f"high {k}" for k in drivers) if drivers else "validation checks failed"
         return f"🔴 Weak: {detail}"
     if overall == "Caution":
-        drivers = [k for k, s in symbols.items() if s == "🟠"]
+        drivers = [k for k, s in symbols.items() if s == "🟡"]
         detail = " + ".join(f"moderate {k}" for k in drivers) if drivers else "elevated validation risk"
-        return f"🟠 Caution: {detail}"
+        return f"🟡 Caution: {detail}"
     if overall == "Strong":
         return "🟢 Strong: validation checks passed"
     return "⚪ Insufficient data: rolling validation unavailable"
@@ -953,7 +953,7 @@ def classify_validation_method(fold_df, main_model_used_cv_fallback):
     did so, or wasn't possible at all due to insufficient pre-period history.
 
     - 🟢 "Rolling-origin validation": every rolling-origin fold used TimeSeriesSplit CV.
-    - 🟠 "Partial rolling-origin validation": some folds were excluded because they
+    - 🟡 "Partial rolling-origin validation": some folds were excluded because they
       didn't have enough training history for TimeSeriesSplit (those folds used the
       exploratory fixed-alpha fallback and are excluded from the headline metrics).
     - ⚪ "Insufficient validation history": no valid TimeSeriesSplit-CV fold is
@@ -970,7 +970,7 @@ def classify_validation_method(fold_df, main_model_used_cv_fallback):
     if n_fallback_folds == 0:
         return "🟢 Rolling-origin validation"
     elif n_fallback_folds < len(fold_df):
-        return "🟠 Partial rolling-origin validation"
+        return "🟡 Partial rolling-origin validation"
     else:
         return "⚪ Insufficient validation history"
 
@@ -3128,7 +3128,7 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
 
     RELIABILITY_LABELS = {
         "Strong": "🟢 Strong",
-        "Caution": "🟠 Caution",
+        "Caution": "🟡 Caution",
         "Weak": "🔴 Weak",
         "Insufficient data": "⚪ Insufficient data",
     }
@@ -3143,11 +3143,9 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         {"Metric": "Pre-Period Correlation", "key": "pre_corr"},
         {"Metric": "Pre-Period R²", "key": "pre_r2"},
         {"Metric": "Pre-Period sMAPE (%)", "key": "pre_smape"},
-        {"Metric": "Pre-Period RMSE", "key": "pre_rmse"},
 
         {"Metric": "C1. ROLLING-ORIGIN VALIDATION - ERROR", "is_section": True},
         {"Metric": "Validation sMAPE (%)", "key": "holdout_smape"},
-        {"Metric": "Validation RMSE", "key": "holdout_rmse"},
         {"Metric": "Validation Error Risk", "key": "rolling_validation_error_risk"},
         
         {"Metric": "C2. ROLLING-ORIGIN VALIDATION - BIAS", "is_section": True},
