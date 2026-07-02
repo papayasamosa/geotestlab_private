@@ -4488,19 +4488,6 @@ def render_time_series_validation(mode: str):
                 else:
                     st.info("No rolling-origin folds were generated — the historical period may be too short for the selected training and window settings.")
 
-            with st.expander("Technical validation details", expanded=False):
-                st.caption(
-                    "Full technical detail behind the **Validation Method** row above — exact fold counts and "
-                    "whether TimeSeriesSplit cross-validation or the exploratory fixed-alpha fallback was used."
-                )
-                st.write(res.get("cv_status", "N/A"))
-
-            if res['neg_pre']:
-                st.warning("⚠️ Negative pre‑period predictions detected – model may produce unrealistic estimates for count KPIs.")
-            if res['neg_test']:
-                st.warning("⚠️ Negative test‑period predictions detected.")
-            if res['neg_post']:
-                st.warning("⚠️ Negative post‑period predictions detected.")
 
             plot_type = st.radio(
                 "Display plot:",
