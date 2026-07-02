@@ -264,170 +264,171 @@ def durbin_watson_stat(residuals):
         return np.nan
     return np.sum(np.diff(residuals) ** 2) / denom
 
-def classify_autocorrelation_interpretation(dw_stat):
+def _is_valid_number(v):
     """
-    Interpret the Durbin-Watson statistic for first-order residual autocorrelation.
+    Shared validity check used by the classify_* traffic-light helpers below.
+    Returns False for None, NaN, pd.NA, and +/-inf; True for any other finite number.
+    """
+    if v is None:
+        return False
+    try:
+        if pd.isna(v):
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        if not np.isfinite(float(v)):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
 
-    Durbin-Watson is an established statistic. These red/amber/green labels are
-    practical interpretation bands for this app, not formal critical-value tests.
+def classify_autocorrelation_risk(dw_stat):
+    """
+    Short traffic-light interpretation of the Durbin-Watson statistic, for the method
+    comparison table row "Autocorrelation Risk".
+
+    Durbin-Watson is an established statistic for first-order residual autocorrelation.
+    These red/amber/green bands are practical interpretation bands for this app, not
+    formal critical-value tests.
 
     Durbin-Watson is approximately:
     - 2.0 = little/no first-order autocorrelation
     - below 2.0 = positive autocorrelation
     - above 2.0 = negative autocorrelation
-
-    For this app, positive autocorrelation is the main concern because it can make
-    the model look more reliable than it is by leaving time-patterned residuals.
     """
-    if dw_stat is None:
-        return "Insufficient data"
-
-    try:
-        if pd.isna(dw_stat) or not np.isfinite(float(dw_stat)):
-            return "Insufficient data"
-    except Exception:
-        return "Insufficient data"
+    if not _is_valid_number(dw_stat):
+        return "⚪ Insufficient data"
 
     dw = float(dw_stat)
 
     if 1.7 <= dw <= 2.3:
-        return "🟢 Near 2: little evidence of first-order autocorrelation"
-    elif 1.3 <= dw < 1.7:
-        return "🟠 Below 2: possible positive autocorrelation"
-    elif dw < 1.3:
-        return "🔴 Far below 2: strong warning for positive autocorrelation"
-    elif 2.3 < dw <= 2.7:
-        return "🟠 Above 2: possible negative autocorrelation"
+        return "🟢 Low"
+    elif (1.3 <= dw < 1.7) or (2.3 < dw <= 2.7):
+        return "🟠 Moderate"
     else:
-        return "🔴 Far above 2: strong warning for negative autocorrelation"
+        return "🔴 High"
 
 def calculate_overfit_gap(pre_smape, rolling_smape):
     """
-    Generalisation Gap: how much worse the model performs out-of-sample (rolling-origin)
-    versus in-sample (pre-period fit). A large positive gap means the model's
-    apparent pre-period accuracy does not hold up out-of-sample when predicting
-    held-out historical periods. This is a validation diagnostic, not a formal
-    statistical test. Returns np.nan if either input is missing, not finite
-    (covers None, np.nan, pd.NA, and +/-inf), or not convertible to a float.
+    Overfitting Gap: how much worse the model performs out-of-sample (rolling-origin)
+    versus in-sample (pre-period fit). A large positive gap means the model looks good
+    on the data it was fitted on, but performs worse when predicting unseen historical
+    periods. This is a validation diagnostic, not a formal statistical test. Returns
+    np.nan if either input is missing, not finite (covers None, np.nan, pd.NA, and
+    +/-inf), or not convertible to a float.
 
     (Internal variable/function names still use "overfit_gap" for backward
-    compatibility; all user-facing labels use "Generalisation Gap".)
+    compatibility; all user-facing labels use "Overfitting Gap".)
     """
-    def _is_valid(v):
-        if v is None:
-            return False
-        try:
-            if pd.isna(v):
-                return False
-        except (TypeError, ValueError):
-            return False
-        try:
-            if not np.isfinite(float(v)):
-                return False
-        except (TypeError, ValueError):
-            return False
-        return True
-
-    if not _is_valid(pre_smape) or not _is_valid(rolling_smape):
+    if not _is_valid_number(pre_smape) or not _is_valid_number(rolling_smape):
         return np.nan
     return float(rolling_smape) - float(pre_smape)
 
-def classify_counterfactual_reliability(
-    overfit_gap_smape,
-    rolling_smape_mean=None,
-    rolling_bias_pct=None,
-    autocorrelation_interpretation=None,
-):
+def classify_overfitting_risk(overfit_gap_smape):
     """
-    Classifies Counterfactual Reliability as Strong, Caution, Weak, or Insufficient data.
+    Short traffic-light rating for the method comparison table row "Overfitting Risk".
 
-    This is a validation-based reliability diagnostic. It uses:
-    - rolling-origin validation error
-    - the generalisation gap between pre-period fit and rolling-origin validation
-    - rolling-origin validation bias
-    - residual autocorrelation interpretation from the Durbin-Watson statistic
-
-    It does not use custom model-complexity heuristics.
-
-    Inputs:
-    - overfit_gap_smape: Generalisation Gap — rolling-origin sMAPE minus pre-period
-      sMAPE (percentage points).
-    - rolling_smape_mean: absolute rolling-origin sMAPE (%). This is the primary signal;
-      if it is missing, rolling-origin validation didn't produce a usable result, and
-      this function returns "Insufficient data" rather than guessing from the other
-      (weaker) signals alone.
-    - rolling_bias_pct: optional rolling-origin bias (%).
-    - autocorrelation_interpretation: optional string from
-      classify_autocorrelation_interpretation(), e.g. "🔴 Far below 2: strong warning
-      for positive autocorrelation" or "🟠 Above 2: possible negative autocorrelation".
-
-    Logic:
-    - If rolling_smape_mean is missing/invalid, returns "Insufficient data" — there is
-      no out-of-sample evidence to anchor a reliability call on.
-    - Otherwise, the starting level comes from rolling_smape_mean thresholds (>30 =
-      "Weak", >20 = "Caution", else "Strong"), then is downgraded by up to one level
-      each for: a large generalisation gap (>8pp downgrades straight to "Weak", >3pp
-      downgrades one level), large rolling bias (>10% downgrades one level), and
-      elevated residual autocorrelation (a 🔴 interpretation downgrades straight to
-      "Weak", a 🟠 interpretation downgrades one level).
-
-    The resulting traffic-light label is an interpretation aid based on validation
-    diagnostics, not a standalone statistical test.
-
-    Missing (np.nan / None / pd.NA / +-inf) inputs are handled gracefully via
-    _is_valid() — an invalid input simply does not contribute evidence rather than
-    raising an error.
+    Uses ONLY the Overfitting Gap (rolling-origin sMAPE minus pre-period sMAPE) — it
+    does not mix in autocorrelation, bias, rolling sMAPE, or placebo results, which
+    each have their own dedicated row. Answers only: does the model look meaningfully
+    worse on held-out historical validation than on the fitted pre-period?
     """
-    levels = ["Strong", "Caution", "Weak"]
+    if not _is_valid_number(overfit_gap_smape):
+        return "⚪ Insufficient data"
+    if overfit_gap_smape <= 3:
+        return "🟢 Low"
+    if overfit_gap_smape <= 8:
+        return "🟠 Moderate"
+    return "🔴 High"
 
-    def _is_valid(v):
-        if v is None:
-            return False
-        try:
-            if pd.isna(v):
-                return False
-        except (TypeError, ValueError):
-            return False
-        try:
-            if not np.isfinite(float(v)):
-                return False
-        except (TypeError, ValueError):
-            return False
-        return True
+def classify_rolling_validation_error(rolling_smape_mean):
+    """
+    Short traffic-light rating for the method comparison table row "Rolling Validation
+    Error", based ONLY on rolling_smape_mean (absolute out-of-sample sMAPE).
 
-    smape_valid = _is_valid(rolling_smape_mean)
-    gap_valid = _is_valid(overfit_gap_smape)
-    bias_valid = _is_valid(rolling_bias_pct)
+    High rolling validation error means the model is inaccurate out-of-sample — this is
+    not the same thing as overfitting (a model can be inaccurate everywhere, in-sample
+    and out-of-sample alike, without a large gap between the two).
+    """
+    if not _is_valid_number(rolling_smape_mean):
+        return "⚪ Insufficient data"
+    if rolling_smape_mean <= 20:
+        return "🟢 Low"
+    if rolling_smape_mean <= 30:
+        return "🟠 Moderate"
+    return "🔴 High"
 
-    # No rolling-origin validation result at all — there is nothing to anchor a
-    # reliability call on, so we don't guess.
-    if not smape_valid:
-        return "Insufficient data"
+def classify_rolling_bias_risk(rolling_bias_pct):
+    """
+    Short traffic-light rating for the method comparison table row "Rolling Bias Risk",
+    based ONLY on rolling_bias_pct — whether the model systematically over- or
+    under-predicts in held-out historical periods.
+    """
+    if not _is_valid_number(rolling_bias_pct):
+        return "⚪ Insufficient data"
+    if abs(rolling_bias_pct) <= 5:
+        return "🟢 Low"
+    if abs(rolling_bias_pct) <= 10:
+        return "🟠 Moderate"
+    return "🔴 High"
 
-    if rolling_smape_mean > 30:
-        level_idx = 2  # Weak
-    elif rolling_smape_mean > 20:
-        level_idx = 1  # Caution
-    else:
-        level_idx = 0  # Strong
+def combine_reliability_ratings(component_ratings):
+    """
+    Derives the overall "Counterfactual Reliability" rating (Strong / Caution / Weak /
+    Insufficient data) from a dict of component traffic-light ratings, e.g.:
+        {
+            "rolling validation error": "🟢 Low",
+            "overfitting gap": "🟠 Moderate",
+            "rolling bias": "🟢 Low",
+            "autocorrelation risk": "⚪ Insufficient data",
+        }
 
-    if gap_valid:
-        if overfit_gap_smape > 8:
-            level_idx = 2  # Weak
-        elif overfit_gap_smape > 3:
-            level_idx = min(level_idx + 1, 2)
+    Rule: take the WORST available component.
+    - Any component 🔴  -> "Weak"
+    - Else any component 🟠  -> "Caution"
+    - Else, if at least one component is available (not ⚪) and all available
+      components are 🟢  -> "Strong"
+    - Otherwise (no components available at all) -> "Insufficient data"
 
-    if bias_valid:
-        if abs(rolling_bias_pct) > 10:
-            level_idx = min(level_idx + 1, 2)
+    This is deliberately simple and explainable: Counterfactual Reliability is nothing
+    more than the worst result among rolling validation error, overfitting gap, rolling
+    bias, and autocorrelation risk — there is no hidden downgrade logic.
+    """
+    symbols = [v.split(" ", 1)[0] for v in component_ratings.values() if v]
+    if any(s == "🔴" for s in symbols):
+        return "Weak"
+    if any(s == "🟠" for s in symbols):
+        return "Caution"
+    available = [s for s in symbols if s != "⚪"]
+    if available and all(s == "🟢" for s in available):
+        return "Strong"
+    return "Insufficient data"
 
-    if autocorrelation_interpretation:
-        if "🔴" in autocorrelation_interpretation:
-            level_idx = 2  # Weak
-        elif "🟠" in autocorrelation_interpretation:
-            level_idx = min(level_idx + 1, 2)
+def get_reliability_drivers(component_ratings):
+    """
+    Produces a short, human-readable explanation of what drove the Counterfactual
+    Reliability rating, e.g. "🟠 Caution: moderate overfitting gap" or
+    "🔴 Weak: high rolling validation error + high autocorrelation risk".
 
-    return levels[level_idx]
+    component_ratings: dict of {short driver label: traffic-light string}, using the
+    same short driver labels as combine_reliability_ratings() (e.g. "rolling
+    validation error", "overfitting gap", "rolling bias", "autocorrelation risk").
+    """
+    overall = combine_reliability_ratings(component_ratings)
+    symbols = {k: v.split(" ", 1)[0] for k, v in component_ratings.items() if v}
+
+    if overall == "Weak":
+        drivers = [k for k, s in symbols.items() if s == "🔴"]
+        detail = " + ".join(f"high {k}" for k in drivers) if drivers else "validation checks failed"
+        return f"🔴 Weak: {detail}"
+    if overall == "Caution":
+        drivers = [k for k, s in symbols.items() if s == "🟠"]
+        detail = " + ".join(f"moderate {k}" for k in drivers) if drivers else "elevated validation risk"
+        return f"🟠 Caution: {detail}"
+    if overall == "Strong":
+        return "🟢 Strong: validation checks passed"
+    return "⚪ Insufficient data: rolling validation unavailable"
 
 # ------------------------------------------------------------
 # Frequency-awareness helpers (weekly vs daily time series)
@@ -917,6 +918,34 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
         )
     return fold_df, rolling_smape_mean, rolling_rmse_mean, cv_status
 
+def classify_validation_method(fold_df, main_model_used_cv_fallback):
+    """
+    Short, stakeholder-facing summary of whether rolling-origin validation for a
+    method used proper leakage-free TimeSeriesSplit cross-validation, only partially
+    did so, or wasn't possible at all due to insufficient pre-period history.
+
+    - 🟢 "Rolling-origin validation": every rolling-origin fold used TimeSeriesSplit CV.
+    - 🟠 "Partial rolling-origin validation": some folds were excluded because they
+      didn't have enough training history for TimeSeriesSplit (those folds used the
+      exploratory fixed-alpha fallback and are excluded from the headline metrics).
+    - ⚪ "Insufficient validation history": no valid TimeSeriesSplit-CV fold is
+      available at all (including when the main pre-period model itself couldn't run
+      TimeSeriesSplit).
+
+    Full technical detail (exact fold counts, fallback settings) is available
+    separately via the "cv_status" string, shown in the "Technical validation
+    details" expander rather than in the headline table.
+    """
+    if main_model_used_cv_fallback or fold_df is None or fold_df.empty or "used_cv_fallback" not in fold_df.columns:
+        return "⚪ Insufficient validation history"
+    n_fallback_folds = int(fold_df["used_cv_fallback"].sum())
+    if n_fallback_folds == 0:
+        return "🟢 Rolling-origin validation"
+    elif n_fallback_folds < len(fold_df):
+        return "🟠 Partial rolling-origin validation"
+    else:
+        return "⚪ Insufficient validation history"
+
 def placebo_analysis(uplift_list, real_uplift):
     uplift_arr = np.array(uplift_list)
     if len(uplift_arr) == 0:
@@ -1104,7 +1133,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         rolling_smape_p90 = rolling_bias_pct_mean = np.nan
         rolling_uplift_error_pct_median = rolling_uplift_error_pct_lower = rolling_uplift_error_pct_upper = np.nan
 
-    # ---- Generalisation Gap (part 1): compare pre-period (in-sample) fit against
+    # ---- Overfitting Gap (part 1): compare pre-period (in-sample) fit against
     # rolling-origin (out-of-sample) accuracy. A large gap means the model looks good
     # in-sample but doesn't hold up out-of-sample when predicting held-out historical
     # periods. This is a validation diagnostic, not a formal statistical test.
@@ -1299,17 +1328,30 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     alpha = getattr(model, "alpha_", np.nan)
 
     # ---- Selected feature count, kept for transparency in the selected-controls
-    # table only. It is NOT used as a reliability diagnostic — reliability is
-    # based solely on validation performance and residual diagnostics (see
-    # classify_counterfactual_reliability() below). ----
+    # table only. It is NOT used as a reliability diagnostic — reliability is based
+    # solely on the four component checks below (rolling validation error,
+    # overfitting gap, rolling bias, autocorrelation risk). ----
     n_selected_features = len(selected_features)
-    autocorrelation_interpretation = classify_autocorrelation_interpretation(dw_stat)
-    counterfactual_reliability = classify_counterfactual_reliability(
-        overfit_gap_smape,
-        rolling_smape_mean=rolling_smape_mean,
-        rolling_bias_pct=rolling_bias_pct_mean,
-        autocorrelation_interpretation=autocorrelation_interpretation,
-    )
+
+    # ---- Component traffic-light ratings. Each is based on exactly one diagnostic —
+    # see classify_rolling_validation_error(), classify_overfitting_risk(),
+    # classify_rolling_bias_risk(), and classify_autocorrelation_risk(). ----
+    rolling_validation_error_risk = classify_rolling_validation_error(rolling_smape_mean)
+    overfitting_risk = classify_overfitting_risk(overfit_gap_smape)
+    rolling_bias_risk = classify_rolling_bias_risk(rolling_bias_pct_mean)
+    autocorrelation_risk = classify_autocorrelation_risk(dw_stat)
+    validation_method_label = classify_validation_method(fold_df, main_model_used_cv_fallback)
+
+    # ---- Counterfactual Reliability: the worst of the four component ratings above,
+    # with a short explanation of which one(s) drove it. No hidden downgrade logic. ----
+    reliability_components = {
+        "rolling validation error": rolling_validation_error_risk,
+        "overfitting gap": overfitting_risk,
+        "rolling bias": rolling_bias_risk,
+        "autocorrelation risk": autocorrelation_risk,
+    }
+    counterfactual_reliability = combine_reliability_ratings(reliability_components)
+    reliability_drivers = get_reliability_drivers(reliability_components)
 
     return {
         "dates_pre": dates_pre,
@@ -1320,7 +1362,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         "smape": s,
         "rmse": rmse,
         "dw_stat": dw_stat,
-        "autocorrelation_interpretation": autocorrelation_interpretation,
+        "autocorrelation_risk": autocorrelation_risk,
         "pre_residuals": pre_residuals,
         "holdout_smape_mean": holdout_smape_mean,
         "holdout_rmse_mean": holdout_rmse_mean,
@@ -1329,11 +1371,15 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         "rolling_rmse_mean": rolling_rmse_mean,
         "rolling_smape_p90": rolling_smape_p90,
         "rolling_bias_pct_mean": rolling_bias_pct_mean,
+        "rolling_validation_error_risk": rolling_validation_error_risk,
+        "rolling_bias_risk": rolling_bias_risk,
         "rolling_uplift_error_pct_median": rolling_uplift_error_pct_median,
         "rolling_uplift_error_pct_lower": rolling_uplift_error_pct_lower,
         "rolling_uplift_error_pct_upper": rolling_uplift_error_pct_upper,
         "overfit_gap_smape": overfit_gap_smape,
         "overfit_gap_rmse": overfit_gap_rmse,
+        "overfitting_risk": overfitting_risk,
+        "validation_method_label": validation_method_label,
         "cv_status": cv_status,
         "used_cv_fallback": main_model_used_cv_fallback or (not fold_df.empty and bool(fold_df["used_cv_fallback"].any())),
         "main_model_used_cv_fallback": main_model_used_cv_fallback,
@@ -1341,7 +1387,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
         "n_pre_periods": n_pre_periods,
         "n_pre_weeks": n_pre_periods,  # backward-compatible alias
         "counterfactual_reliability": counterfactual_reliability,
-        "overfitting_risk": counterfactual_reliability,  # backward-compatible alias
+        "reliability_drivers": reliability_drivers,
         "min_training_periods": min_training_periods,
         "min_training_weeks": min_training_periods,  # backward-compatible alias
         "validation_window_periods": cv_horizon,
@@ -3894,13 +3940,13 @@ def render_time_series_validation(mode: str):
                         f"Check whether your daily data has gaps."
                     )
 
-            # ---- High validation error, even when the generalisation gap is small (item 13) ----
+            # ---- High validation error, even when the overfitting gap is small (item 13) ----
             _rolling_smape_mean = res.get("rolling_smape_mean", res.get("holdout_smape_mean", np.nan))
             if _rolling_smape_mean is not None and not (isinstance(_rolling_smape_mean, float) and np.isnan(_rolling_smape_mean)):
                 if _rolling_smape_mean > 30:
                     st.error(
                         f"High validation error: rolling-origin sMAPE is {_rolling_smape_mean:.1f}%. "
-                        "Even if the Generalisation Gap is small, the model is not predicting the test group accurately enough to support a reliable uplift estimate."
+                        "Even if the Overfitting Gap is small, the model is not predicting the test group accurately enough to support a reliable uplift estimate."
                     )
                 elif _rolling_smape_mean > 20:
                     st.warning(
@@ -4001,6 +4047,13 @@ def render_time_series_validation(mode: str):
                 else:
                     st.info("No rolling-origin folds were generated — the historical period may be too short for the selected training and window settings.")
 
+            with st.expander("Technical validation details", expanded=False):
+                st.caption(
+                    "Full technical detail behind the **Validation Method** row above — exact fold counts and "
+                    "whether TimeSeriesSplit cross-validation or the exploratory fixed-alpha fallback was used."
+                )
+                st.write(res.get("cv_status", "N/A"))
+
             if res['neg_pre']:
                 st.warning("⚠️ Negative pre‑period predictions detected – model may produce unrealistic estimates for count KPIs.")
             if res['neg_test']:
@@ -4093,26 +4146,31 @@ def render_time_series_validation(mode: str):
             {"Metric": "Pre-Period sMAPE (%)", "key": "pre_smape"},
             {"Metric": "Pre-Period RMSE", "key": "pre_rmse"},
 
-            {"Metric": "C. RESIDUAL DIAGNOSTICS", "is_section": True},
-            {"Metric": "Durbin-Watson", "key": "dw_stat"},
-            {"Metric": "Residual Autocorrelation Interpretation", "key": "autocorrelation_interpretation"},
-
-            {"Metric": "D. ROLLING-ORIGIN VALIDATION", "is_section": True},
-            {"Metric": "CV Method", "key": "cv_status_short"},
+            {"Metric": "C. ROLLING VALIDATION", "is_section": True},
+            {"Metric": "Validation Method", "key": "validation_method_label"},
             {"Metric": "Rolling Validation sMAPE (%)", "key": "holdout_smape"},
+            {"Metric": "Rolling Validation Error", "key": "rolling_validation_error_risk"},
             {"Metric": "Rolling-Origin sMAPE — Worst Case (P90)", "key": "rolling_smape_p90"},
-            {"Metric": "Rolling-Origin RMSE", "key": "holdout_rmse"},
-            {"Metric": "Rolling-Origin Bias (%)", "key": "rolling_bias_pct_mean"},
+            {"Metric": "Rolling Validation RMSE", "key": "holdout_rmse"},
+            {"Metric": "Rolling Bias (%)", "key": "rolling_bias_pct_mean"},
+            {"Metric": "Rolling Bias Risk", "key": "rolling_bias_risk"},
 
-            {"Metric": "E. MODEL VALIDATION DIAGNOSTICS", "is_section": True},
-            {"Metric": "Generalisation Gap, sMAPE percentage points", "key": "overfit_gap_smape"},
-            {"Metric": "Generalisation Gap RMSE", "key": "overfit_gap_rmse"},
+            {"Metric": "D. OVERFITTING CHECK", "is_section": True},
+            {"Metric": "Overfitting Gap, sMAPE percentage points", "key": "overfit_gap_smape"},
+            {"Metric": "Overfitting Risk", "key": "overfitting_risk"},
+
+            {"Metric": "E. RESIDUAL DIAGNOSTICS", "is_section": True},
+            {"Metric": "Durbin-Watson", "key": "dw_stat"},
+            {"Metric": "Autocorrelation Risk", "key": "autocorrelation_risk"},
+
+            {"Metric": "F. OVERALL RELIABILITY", "is_section": True},
             {"Metric": "Counterfactual Reliability", "key": "counterfactual_reliability"},
+            {"Metric": "Reliability Drivers", "key": "reliability_drivers"},
 
-            {"Metric": "F. PLACEBO TESTING", "is_section": True},
-            {"Metric": "Placebo Windows Run", "key": "placebo_windows"},
-            {"Metric": "Typical Placebo Uplift", "key": "median_placebo_uplift_pct"},
-            {"Metric": "Placebo Uplift Range (95%)", "key": "placebo_range_pct"},
+            {"Metric": "G. PLACEBO TESTING", "is_section": True},
+            {"Metric": "Placebo Windows", "key": "placebo_windows"},
+            {"Metric": "Median Placebo Uplift", "key": "median_placebo_uplift_pct"},
+            {"Metric": "95% Placebo Uplift Range", "key": "placebo_range_pct"},
             {"Metric": "Placebo Forecast Error — avg sMAPE", "key": "median_placebo_smape"},
             {"Metric": "Placebo Forecast Error — worst case (P95)", "key": "p95_placebo_smape"},
         ]
@@ -4154,13 +4212,8 @@ def render_time_series_validation(mode: str):
             elif key == "n_selected_features":
                 v = res.get("n_selected_features", None)
                 return str(v) if v is not None else "N/A"
-            elif key == "cv_status_short":
-                if res.get("main_model_used_cv_fallback"):
-                    return "⚪ Insufficient data for CV (no reliability rating)"
-                elif res.get("used_cv_fallback"):
-                    return "🟠 TimeSeriesSplit CV (some folds excluded)"
-                else:
-                    return "🟢 TimeSeriesSplit CV"
+            elif key == "validation_method_label":
+                return res.get("validation_method_label", "⚪ Insufficient validation history")
             elif key == "pre_corr":
                 return _fmt_num(res.get('corr', np.nan), decimals=3)
             elif key == "pre_r2":
@@ -4174,22 +4227,29 @@ def render_time_series_validation(mode: str):
                 if dw is None or (isinstance(dw, float) and np.isnan(dw)):
                     return "N/A"
                 return f"{dw:.2f}"
-            elif key == "autocorrelation_interpretation":
-                interpretation = res.get("autocorrelation_interpretation", None)
-                return interpretation if interpretation else "N/A"
+            elif key == "autocorrelation_risk":
+                return res.get("autocorrelation_risk", "⚪ Insufficient data")
             elif key == "holdout_smape":
                 return _fmt_pct(res.get('holdout_smape_mean', np.nan))
+            elif key == "rolling_validation_error_risk":
+                return res.get("rolling_validation_error_risk", "⚪ Insufficient data")
             elif key == "holdout_rmse":
                 return _fmt_num(res.get('holdout_rmse_mean', np.nan))
             elif key == "rolling_smape_p90":
                 return _fmt_pct(res.get("rolling_smape_p90", np.nan))
             elif key == "rolling_bias_pct_mean":
                 return _fmt_pct(res.get("rolling_bias_pct_mean", np.nan))
+            elif key == "rolling_bias_risk":
+                return res.get("rolling_bias_risk", "⚪ Insufficient data")
             elif key == "overfit_gap_smape":
                 v = res.get("overfit_gap_smape", np.nan)
                 return f"{v:.1f} pp" if not (v is None or (isinstance(v, float) and np.isnan(v))) else "N/A"
             elif key == "overfit_gap_rmse":
                 return _fmt_num(res.get("overfit_gap_rmse", np.nan))
+            elif key == "overfitting_risk":
+                return res.get("overfitting_risk", "⚪ Insufficient data")
+            elif key == "reliability_drivers":
+                return res.get("reliability_drivers", "⚪ Insufficient data: rolling validation unavailable")
             elif key == "counterfactual_reliability":
                 reliability = res.get("counterfactual_reliability", None)
                 return RELIABILITY_LABELS.get(reliability, "N/A")
@@ -4249,17 +4309,28 @@ def render_time_series_validation(mode: str):
         st.dataframe(styled_comp, width='stretch', hide_index=False)
 
         st.caption(
-            "Durbin-Watson is an established statistic for first-order residual autocorrelation. Values near 2 "
-            "suggest little autocorrelation; values materially below 2 suggest positive autocorrelation; values "
-            "materially above 2 suggest negative autocorrelation. The traffic-light label is an interpretation "
-            "band, not a formal critical-value test."
+            "Durbin-Watson checks whether residuals are autocorrelated. Values near 2 are good. Values far "
+            "below or above 2 suggest the model is missing time patterns."
         )
         st.caption(
-            "**Counterfactual Reliability** summarises whether the control model appears reliable enough to support "
-            "a counterfactual estimate. It is based primarily on rolling-origin validation performance, then "
-            "downgraded where there is evidence of poor generalisation, systematic validation bias, or residual "
-            "autocorrelation. The traffic-light label is an interpretation aid based on validation diagnostics, "
-            "not a standalone statistical test."
+            "**Overfitting Gap** compares the model's in-sample pre-period error with its held-out rolling "
+            "validation error. A large positive gap means the model looks good on the data it was fitted on, "
+            "but performs worse when predicting unseen historical periods."
+        )
+        st.caption(
+            "**Rolling Validation Error** shows whether the model can predict held-out historical periods. "
+            "Lower is better."
+        )
+        st.caption(
+            "**Rolling Bias** checks whether the model systematically over- or under-predicts in held-out "
+            "historical periods."
+        )
+        st.caption(
+            "**Counterfactual Reliability** is the overall traffic-light summary. It takes the worst result "
+            "from the main validation checks: rolling validation error, overfitting gap, rolling bias, and "
+            "residual autocorrelation. **Reliability Drivers** explains which check(s) drove the rating. "
+            "Traffic-light bands are interpretation aids based on validation diagnostics — they are not "
+            "standalone hypothesis tests."
         )
         st.caption(
             "⚪ **Insufficient data** means there were not enough rolling-origin validation windows to assess "
@@ -4269,7 +4340,8 @@ def render_time_series_validation(mode: str):
         st.caption(
             "Placebo uplift ranges are based on historical fake-test windows. They show how much apparent "
             "uplift could occur when no real intervention happened. If the observed test uplift sits inside "
-            "this range, it may not be distinguishable from normal historical noise."
+            "this range, it may not be distinguishable from normal historical noise. Placebo testing is a "
+            "separate robustness check and is not folded into Counterfactual Reliability."
         )
 
         # ---- Interpretation help ----
@@ -4292,13 +4364,24 @@ This checks whether the model can predict held-out historical periods using only
 
 ---
 
-**Step 2 — Check Model Validation Diagnostics**
+**Step 2 — Check Overfitting / Reliability Checks**
 
 A method can look excellent in-sample and still be unreliable if it's fitting coincidental historical patterns rather than a genuine relationship.
 
-- **Generalisation Gap, sMAPE percentage points** — Compares in-sample pre-period fit with rolling-origin validation performance. A large positive gap (roughly above 3–8 percentage points) means the model performs worse when predicting held-out historical periods than it does when fitted on the full pre-period, so the pre-period fit is flattering and won't hold up. This is a validation diagnostic, not a formal statistical test.
-- **Residual Autocorrelation Interpretation** — Durbin-Watson is an established statistic for first-order residual autocorrelation. Values near 2 suggest little autocorrelation; values materially below 2 suggest positive autocorrelation; values materially above 2 suggest negative autocorrelation. The traffic-light label is an interpretation band, not a formal critical-value test.
-- **Counterfactual Reliability** — Summarises this validation evidence and downgrades the rating if the model has a large Generalisation Gap, systematic rolling-origin bias, or residual autocorrelation. Treat "Weak" results with real caution, especially for data-optimised methods. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess this — this is a data-availability gap, not evidence that reliability is strong. The traffic-light label is an interpretation aid based on validation diagnostics, not a standalone statistical test.
+- **Overfitting Gap, sMAPE percentage points** — Compares the model's in-sample pre-period error with its held-out rolling validation error. A large positive gap (roughly above 3–8 percentage points) means the model looks good on the data it was fitted on, but performs worse when predicting unseen historical periods. This is a validation diagnostic, not a formal statistical test.
+- **Overfitting Risk** — A short traffic-light rating based only on the Overfitting Gap: does the model look meaningfully worse on held-out historical validation than on the fitted pre-period?
+- **Durbin-Watson** / **Autocorrelation Risk** — Durbin-Watson is an established statistic for first-order residual autocorrelation. Values near 2 suggest little autocorrelation; values materially below or above 2 suggest the model is missing time patterns. The traffic-light label is an interpretation band, not a formal critical-value test.
+- **Counterfactual Reliability** — The overall traffic-light summary. It takes the worst result from the main validation checks: Rolling Validation Error, Overfitting Risk, Rolling Bias Risk, and Autocorrelation Risk. **Reliability Drivers** explains which check(s) drove the rating. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess this — this is a data-availability gap, not evidence that reliability is strong.
+
+**How to read the reliability checks**
+
+1. **Rolling Validation Error** checks whether the model predicts held-out historical periods accurately.
+2. **Overfitting Risk** checks whether the model performs much worse on held-out periods than it does on the fitted pre-period.
+3. **Rolling Bias Risk** checks whether the model systematically over- or under-predicts.
+4. **Autocorrelation Risk** checks whether residuals still contain time patterns.
+5. **Counterfactual Reliability** takes the worst of these checks as the overall rating.
+
+Traffic-light bands are interpretation aids based on validation diagnostics. They are not standalone hypothesis tests.
 
 ---
 
@@ -4306,8 +4389,8 @@ A method can look excellent in-sample and still be unreliable if it's fitting co
 
 Placebo tests simulate running a fake intervention across all available historical windows. A well-behaved model produces placebo uplifts clustered near zero.
 
-- **Typical Placebo Uplift** — Should be close to 0%. Large values mean the model consistently finds phantom effects.
-- **Placebo Uplift Range (95%)** — The full spread of placebo (fake-test) uplifts. **This is your rough minimum detectable effect:** if your target uplift is smaller than this range, the design may lack power to distinguish a real signal from historical noise. A wide range also means the model is volatile — your real test uplift will need to sit clearly outside it to be credible.
+- **Median Placebo Uplift** — Should be close to 0%. Large values mean the model consistently finds phantom effects.
+- **95% Placebo Uplift Range** — The full spread of placebo (fake-test) uplifts. **This is your rough minimum detectable effect:** if your target uplift is smaller than this range, the design may lack power to distinguish a real signal from historical noise. A wide range also means the model is volatile — your real test uplift will need to sit clearly outside it to be credible.
 
 ---
 
@@ -4335,8 +4418,18 @@ Start with Rolling-Origin Validation. This checks whether the model can predict 
 
 - **Rolling-Origin sMAPE (%)** — Typical out-of-sample prediction error. If this is above 15–20%, treat the uplift estimate with caution — the counterfactual baseline is uncertain.
 - **Rolling-Origin Bias (%)** — Persistent bias in the model's predictions. A model that consistently undershoots will overstate uplift, and vice versa.
-- **Counterfactual Reliability** — Summarises this validation evidence and downgrades the rating if the model has a large Generalisation Gap, systematic rolling-origin bias, or residual autocorrelation. If this is "Weak", treat the uplift number with extra caution, particularly for data-optimised methods. If it shows "Insufficient data", there wasn't enough rolling-origin history to assess this at all — treat the uplift with the same caution you would give a "Weak" result. The traffic-light label is an interpretation aid, not a formal statistical test.
-- **Placebo Uplift Range (95%)** — The range of apparent uplifts the model detects in historical periods with no intervention. Your observed uplift needs to sit clearly outside this range.
+- **Counterfactual Reliability** — The overall traffic-light summary. It takes the worst result from the main validation checks: Rolling Validation Error, Overfitting Risk, Rolling Bias Risk, and Autocorrelation Risk. **Reliability Drivers** explains which check(s) drove the rating. If this is "Weak", treat the uplift number with extra caution, particularly for data-optimised methods. If it shows "Insufficient data", there wasn't enough rolling-origin history to assess this at all — treat the uplift with the same caution you would give a "Weak" result. The traffic-light label is an interpretation aid, not a formal statistical test.
+- **95% Placebo Uplift Range** — The range of apparent uplifts the model detects in historical periods with no intervention. Your observed uplift needs to sit clearly outside this range.
+
+**How to read the reliability checks**
+
+1. **Rolling Validation Error** checks whether the model predicts held-out historical periods accurately.
+2. **Overfitting Risk** checks whether the model performs much worse on held-out periods than it does on the fitted pre-period.
+3. **Rolling Bias Risk** checks whether the model systematically over- or under-predicts.
+4. **Autocorrelation Risk** checks whether residuals still contain time patterns.
+5. **Counterfactual Reliability** takes the worst of these checks as the overall rating.
+
+Traffic-light bands are interpretation aids based on validation diagnostics. They are not standalone hypothesis tests.
 
 ---
 
