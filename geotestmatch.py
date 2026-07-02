@@ -4434,7 +4434,7 @@ def render_time_series_validation(mode: str):
                     f"Rolling-origin validation used a **{_vw}-{_period_word}** forecast horizon "
                     f"and required at least **{_mt} {_period_word_plural}** of training history before each validation window."
                 )
-                _rcv_col1 = st.columns(1)
+                _rcv_col1 = st.columns(1)[0]
                 _rcv_col1.metric(
                     "Average Out-of-Sample sMAPE",
                     f"{res['holdout_smape_mean']:.1f}%" if not np.isnan(res['holdout_smape_mean']) else "-",
