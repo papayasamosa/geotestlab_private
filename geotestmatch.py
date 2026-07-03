@@ -1114,12 +1114,21 @@ def _summarize_rolling_origin_folds(fold_df):
         "rolling_uplift_error_pct_upper": upper,
     }
 
-def _run_placebo_windows(model_pre, model_feature_cols, dates_pre, min_training_periods, placebo_len, method_name):
+def _run_placebo_windows(model_pre, model_feature_cols, dates_pre, min_training_periods, placebo_len, method_name,
+                          max_windows=40):
     """
     Simulates a fake intervention across all available historical pre-period windows
     ("placebo testing"): repeatedly trains on an expanding window and evaluates on the
     next placebo_len periods, using the same model type as the main fit. Never falls
     back to regular KFold for time-series data — see build_regularized_model().
+
+    Subsamples to at most `max_windows` evenly-spaced windows when more are available,
+    to keep runtime bounded (each window fits a fresh model). This caps the resolution
+    of any empirical p-value / percentile rank derived from the result at roughly
+    1/max_windows — e.g. with the default of 40, the smallest nonzero one-sided p-value
+    achievable is ~0.025, not smaller. Callers that report a p-value alongside the
+    "Placebo Windows" count should treat "p < 0.05" claims from very small window counts
+    with this precision limit in mind.
 
     Returns four parallel lists (placebos, placebo_uplift_pcts, placebo_smapes,
     placebo_rmses), one entry per placebo window. All empty if placebo_len is missing/
@@ -1135,9 +1144,9 @@ def _run_placebo_windows(model_pre, model_feature_cols, dates_pre, min_training_
         return placebos, placebo_uplift_pcts, placebo_smapes, placebo_rmses
 
     all_starts = list(range(min_training_periods, n_pre - placebo_len + 1))
-    if len(all_starts) > 20:
-        step = len(all_starts) // 20
-        all_starts = all_starts[::step][:20]
+    if len(all_starts) > max_windows:
+        step = len(all_starts) // max_windows
+        all_starts = all_starts[::step][:max_windows]
 
     for start_idx in all_starts:
         train_dates = dates_pre[:start_idx]
@@ -3386,6 +3395,13 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         "this range, it may not be distinguishable from normal historical noise."
     )
     st.caption(
+        "**Uplift Percentile vs Placebos** and **Uplift p-value** are empirical, derived directly from the "
+        "**Placebo Windows** count shown above — their resolution is limited to roughly 1 / (that count). "
+        "With few placebo windows, a p-value can only take a few discrete values (e.g. 10 windows means "
+        "p can only land on multiples of 0.1), so treat a borderline result with a low placebo-window count "
+        "with extra caution."
+    )
+    st.caption(
         "**Overall Counterfactual Confidence** is a priority-ordered summary, not a simple worst-of-four "
         "vote. Rolling Validation Error is the primary check and acts as a gate: a high-risk validation "
         "error alone makes confidence low. Overfitting, Autocorrelation Risk, and Rolling Bias are "
@@ -3532,6 +3548,7 @@ Traffic-light bands are interpretation aids based on validation diagnostics. The
 
 - **Observed Uplift Percentile vs Placebos** — Where your observed uplift ranks relative to the distribution of historical placebo (fake-test) uplifts. 95th percentile or above is stronger evidence that the observed uplift is unusual relative to pre-period noise.
 - **Observed Uplift p-value** — The placebo p-value is an empirical extremeness check: it shows how unusual the observed uplift is relative to historical fake-test windows. It is not proof of causality and should be interpreted alongside model fit, rolling-origin validation, and business context. Below 0.05 is the conventional (approximate) threshold analysts use as a rule of thumb.
+- **A precision note:** both of these are only as fine-grained as the number of **Placebo Windows** available (shown in section F). With, say, 10 placebo windows, the p-value can only land on multiples of 0.1 — it's not possible to observe a "real" 0.02. Check the Placebo Windows count before leaning heavily on a borderline p-value or percentile.
 
 ---
 
@@ -3947,8 +3964,8 @@ def render_time_series_validation(mode: str):
         if not pre_periods_eval:
             pre_periods_eval = (pd.Timestamp(pre_end) - pd.Timestamp(pre_start)).days // _period_divisor + 1
         _min_training_floor = 6 if freq_config["frequency"] == "weekly" else 14
-        _placebo_slider_min = 2 if freq_config["frequency"] == "weekly" else 7
-        _placebo_slider_max = max(12 if freq_config["frequency"] == "weekly" else 90, default_placebo_len)
+        # Note: unlike Design mode, there's no _placebo_slider_min/_placebo_slider_max here —
+        # placebo_length_periods is locked to default_placebo_len below, not user-adjustable.
 
         _slider_col1, _slider_col2 = st.columns(2)
         with _slider_col1:
@@ -3965,16 +3982,27 @@ def render_time_series_validation(mode: str):
                 on_change=clear_validation_state
             )
         with _slider_col2:
-            _placebo_default_value = min(max(default_placebo_len, _placebo_slider_min), _placebo_slider_max)
-            placebo_length_periods = st.slider(
+            # ---- LOCKED, not a slider, in Evaluate mode. ----
+            # The observed uplift is always computed over the actual test_start..test_end
+            # dates (see run_validation_method()), so every placebo window used to build
+            # the comparison distribution — and the rolling-origin validation horizon,
+            # which is deliberately kept equal to it (see cv_horizon in
+            # run_validation_method()) — MUST use that same window length. If this were
+            # independently adjustable, the observed uplift (summed over N_test periods)
+            # could be compared against placebo uplifts summed over a different number of
+            # periods, silently invalidating the percentile rank, p-value, and z-score in
+            # the "Observed Uplift vs Placebos" section — cumulative uplift and its
+            # variance both scale with window length, so the two would no longer be on
+            # the same scale.
+            placebo_length_periods = default_placebo_len
+            st.metric(
                 f"Test & placebo window length ({freq_config['period_label_plural']})",
-                min_value=_placebo_slider_min,
-                max_value=_placebo_slider_max,
-                value=_placebo_default_value,
-                step=1,
-                key=f"{mode_prefix}_placebo_slider",
-                help="Length of each simulated test window used for placebo testing and rolling-origin validation. Set this to match your planned test duration.",
-                on_change=clear_validation_state
+                placebo_length_periods,
+            )
+            st.caption(
+                "Locked to your observed test period length so placebo windows and "
+                "rolling-origin validation folds stay directly comparable to your actual "
+                "test."
             )
 
         # ---- Definitive pre-period sufficiency check, using the ACTUAL selected slider
