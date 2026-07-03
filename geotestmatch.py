@@ -411,60 +411,97 @@ def combine_reliability_ratings(component_ratings):
             "autocorrelation risk": "⚪ Insufficient data",
         }
 
-    Rule: take the WORST available component.
-    - Any component 🔴  -> "🔴 Low confidence"
-    - Else any component 🟡  -> "🟡 Moderate confidence"
-    - Else, if at least one component is available (not ⚪) and all available
-      components are 🟢  -> "🟢 High confidence"
-    - Otherwise (no components available at all) -> "⚪ Insufficient data"
+    This is a PRIORITY-ORDERED CASCADE, not a flat "worst of four" vote. The four
+    checks are not equally important: Rolling Validation Error is the primary
+    model-quality check (can this model predict unseen historical data at all?), so it
+    is evaluated first and acts as a gate. Overfitting, Autocorrelation Risk, and
+    Rolling Bias are evaluated next, in that priority order, as secondary checks that
+    can still hold confidence back but cannot single-handedly force it all the way down
+    to low the way Rolling Validation Error can.
 
-    This is deliberately simple and explainable: Counterfactual Confidence is nothing
-    more than the worst result among rolling validation error, overfitting gap, rolling
-    bias, and autocorrelation risk — there is no hidden downgrade logic.
+    Rule (first match wins):
+    1. Rolling Validation Error 🔴  -> "🔴 Low confidence", regardless of the other
+       three checks. A model that can't predict held-out history is not rescued by
+       good residual diagnostics or low bias.
+    2. Rolling Validation Error ⚪ (unavailable) -> "⚪ Insufficient data", regardless
+       of the other three. The primary check must be available to make any judgement.
+    3. Rolling Validation Error 🟡  -> "🟡 Moderate confidence". A moderate primary
+       check caps confidence at moderate; it cannot reach high, and the secondary
+       checks cannot pull it below moderate either.
+    4. Rolling Validation Error 🟢, but Overfitting, Autocorrelation Risk, or Rolling
+       Bias is 🔴 or 🟡 -> "🟡 Moderate confidence". A secondary check that is flagged
+       is not ignored, but on its own it caps confidence at moderate rather than
+       forcing it to low.
+    5. Rolling Validation Error 🟢 and all available secondary checks are 🟢
+       -> "🟢 High confidence".
 
     (Internal variable/function names still use "reliability" for backward
     compatibility; all user-facing labels use "Counterfactual Confidence".)
     """
-    symbols = [v.split(" ", 1)[0] for v in component_ratings.values() if v]
-    if any(s == "🔴" for s in symbols):
+    def _sym(key):
+        v = component_ratings.get(key)
+        return v.split(" ", 1)[0] if v else "⚪"
+
+    validation_error_sym = _sym("rolling validation error")
+    secondary_syms = [
+        _sym("overfitting gap"),
+        _sym("autocorrelation risk"),
+        _sym("rolling bias"),
+    ]
+
+    # ---- 1-2: Rolling Validation Error is the primary gate. ----
+    if validation_error_sym == "🔴":
         return "🔴 Low confidence"
-    if any(s == "🟡" for s in symbols):
+    if validation_error_sym == "⚪":
+        return "⚪ Insufficient data"
+
+    # ---- 3: A moderate primary check caps confidence at moderate. ----
+    if validation_error_sym == "🟡":
         return "🟡 Moderate confidence"
-    available = [s for s in symbols if s != "⚪"]
-    if available and all(s == "🟢" for s in available):
-        return "🟢 High confidence"
-    return "⚪ Insufficient data"
+
+    # ---- 4-5: Rolling Validation Error is 🟢 — secondary checks can only hold
+    # confidence back to moderate, never force it down to low. ----
+    available_secondary = [s for s in secondary_syms if s != "⚪"]
+    if any(s in ("🔴", "🟡") for s in available_secondary):
+        return "🟡 Moderate confidence"
+    return "🟢 High confidence"
 
 def get_reliability_drivers(component_ratings):
     """
     Produces a short, human-readable explanation of what drove the Counterfactual
     Confidence rating, e.g. "Moderate overfitting gap" or
-    "High autocorrelation risk + moderate rolling bias".
+    "High rolling validation error + moderate rolling bias".
 
     component_ratings: dict of {short driver label: traffic-light string}, using the
     same short driver labels as combine_reliability_ratings() (e.g. "rolling
     validation error", "overfitting gap", "rolling bias", "autocorrelation risk").
 
-    Unlike an earlier version of this function, the returned text lists ALL relevant
-    issues rather than only the issues at the single worst severity level — e.g. if
-    confidence is low because of a high-risk component, any moderate-risk components
-    are also included, not just the high-risk one(s).
+    Lists ALL flagged issues, not just the one(s) that determined the overall rating —
+    e.g. if Rolling Validation Error is high (which alone forces low confidence) and
+    Rolling Bias is also moderate, both are shown. Issues are listed in the same
+    priority order used by combine_reliability_ratings(): rolling validation error,
+    overfitting gap, autocorrelation risk, then rolling bias.
     """
     overall = combine_reliability_ratings(component_ratings)
     symbols = {k: v.split(" ", 1)[0] for k, v in component_ratings.items() if v}
 
-    if overall == "🔴 Low confidence":
-        drivers = [f"high {k}" for k, s in symbols.items() if s == "🔴"]
-        drivers += [f"moderate {k}" for k, s in symbols.items() if s == "🟡"]
-        detail = " + ".join(drivers) if drivers else "validation checks failed"
-        return f"{detail[:1].upper()}{detail[1:]}"
-    if overall == "🟡 Moderate confidence":
-        drivers = [f"moderate {k}" for k, s in symbols.items() if s == "🟡"]
-        detail = " + ".join(drivers) if drivers else "elevated validation risk"
-        return f"{detail[:1].upper()}{detail[1:]}"
     if overall == "🟢 High confidence":
         return "Validation checks passed"
-    return "Insufficient validation data to assess confidence"
+    if overall == "⚪ Insufficient data":
+        return "Insufficient validation data to assess confidence"
+
+    priority_order = [
+        "rolling validation error",
+        "overfitting gap",
+        "autocorrelation risk",
+        "rolling bias",
+    ]
+    reds = [f"high {k}" for k in priority_order if symbols.get(k) == "🔴"]
+    yellows = [f"moderate {k}" for k in priority_order if symbols.get(k) == "🟡"]
+    drivers = reds + yellows
+    fallback = "validation checks failed" if overall == "🔴 Low confidence" else "elevated validation risk"
+    detail = " + ".join(drivers) if drivers else fallback
+    return f"{detail[:1].upper()}{detail[1:]}"
 
 # ------------------------------------------------------------
 # Frequency-awareness helpers (weekly vs daily time series)
@@ -1463,13 +1500,14 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     autocorrelation_risk = classify_autocorrelation_risk(dw_stat)
     validation_method_label = classify_validation_method(fold_df, main_model_used_cv_fallback)
 
-    # ---- Counterfactual Confidence: the worst of the four component ratings above,
-    # with a short explanation of which one(s) drove it. No hidden downgrade logic. ----
+    # ---- Counterfactual Confidence: a priority-ordered cascade led by Rolling
+    # Validation Error, with a short explanation of every check that contributed. See
+    # combine_reliability_ratings() for the full cascade logic. ----
     reliability_components = {
         "rolling validation error": rolling_validation_error_risk,
         "overfitting gap": overfitting_risk,
-        "rolling bias": rolling_bias_risk,
         "autocorrelation risk": autocorrelation_risk,
+        "rolling bias": rolling_bias_risk,
     }
     counterfactual_reliability = combine_reliability_ratings(reliability_components)
     reliability_drivers = get_reliability_drivers(reliability_components)
@@ -3348,9 +3386,11 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         "this range, it may not be distinguishable from normal historical noise."
     )
     st.caption(
-        "**Overall Counterfactual Confidence** is the overall traffic-light summary. It takes the worst "
-        "result from the main validation checks: rolling validation error, overfitting gap, residual "
-        "autocorrelation, and rolling bias."
+        "**Overall Counterfactual Confidence** is a priority-ordered summary, not a simple worst-of-four "
+        "vote. Rolling Validation Error is the primary check and acts as a gate: a high-risk validation "
+        "error alone makes confidence low. Overfitting, Autocorrelation Risk, and Rolling Bias are "
+        "evaluated next in that order — a flag on any of them holds confidence at moderate, but only "
+        "Rolling Validation Error can push it all the way down to low."
     )
     st.caption(
         "**Key Issues** lists all the high- and moderate-risk checks that drove the confidence rating, "
@@ -3406,7 +3446,7 @@ Bias tells you whether the model systematically over- or under-predicts in valid
 
 **Step 5 — Use Overall Counterfactual Confidence as the final summary**
 
-- **Overall Counterfactual Confidence** — The overall traffic-light summary. It takes the worst result from the checks above: Rolling Validation Error, Overfitting Risk, Autocorrelation Risk, and Rolling Bias Risk. **Key Issues** lists every high- and moderate-risk check that contributed, not just the single worst one.
+- **Overall Counterfactual Confidence** — Not a simple worst-of-four vote. Rolling Validation Error is the primary check and acts as a gate: a high-risk validation error alone is enough to make confidence low. Overfitting Risk, Autocorrelation Risk, and Rolling Bias Risk are evaluated next in that priority order — a flag on any of them holds confidence at moderate, but only Rolling Validation Error can push it all the way down to low. **Key Issues** lists every high- and moderate-risk check that contributed, not just the single worst one.
     - 🟢 **High confidence** — Suitable to proceed, assuming the business context also makes sense.
     - 🟡 **Moderate confidence** — Usable, but interpret uplift cautiously and check the Key Issues.
     - 🔴 **Low confidence** — Don't rely on the counterfactual without improving the model, controls, or time window.
@@ -3477,7 +3517,7 @@ Bias tells you whether the model systematically over- or under-predicts in valid
 
 **Step 5 — Use Overall Counterfactual Confidence as the final summary**
 
-- **Overall Counterfactual Confidence** — The overall traffic-light summary. It takes the worst result from the checks above: Rolling Validation Error, Overfitting Risk, Autocorrelation Risk, and Rolling Bias Risk. **Key Issues** lists every high- and moderate-risk check that contributed, not just the single worst one.
+- **Overall Counterfactual Confidence** — Not a simple worst-of-four vote. Rolling Validation Error is the primary check and acts as a gate: a high-risk validation error alone is enough to make confidence low, particularly for data-optimised methods. Overfitting Risk, Autocorrelation Risk, and Rolling Bias Risk are evaluated next in that priority order — a flag on any of them holds confidence at moderate, but only Rolling Validation Error can push it all the way down to low. **Key Issues** lists every high- and moderate-risk check that contributed, not just the single worst one.
     - 🟢 **High confidence** — Suitable to proceed, assuming the business context also makes sense.
     - 🟡 **Moderate confidence** — Usable, but interpret uplift cautiously and check the Key Issues, particularly for data-optimised methods.
     - 🔴 **Low confidence** — Don't rely on the counterfactual without improving the model, controls, or time window.
