@@ -600,6 +600,34 @@ def format_range(lower, upper, suffix="", decimals=1):
     fmt = f"{{:.{decimals}f}}"
     return f"{fmt.format(lower)}{suffix} to {fmt.format(upper)}{suffix}"
 
+def build_chart_data_xlsx(sheets):
+    """
+    Builds an in-memory .xlsx workbook (as bytes) from one or more DataFrames, for use
+    with st.download_button() next to a chart — lets users export the exact data behind
+    a Plotly chart, since Plotly's own modebar only exports a PNG snapshot, not data.
+
+    sheets: dict of {sheet_name: DataFrame}. None values are skipped (e.g. an "Indexed"
+    sheet that couldn't be computed because the pre-period average was zero) rather than
+    written as an empty sheet. Sheet names are truncated to Excel's 31-character limit.
+
+    Returns bytes ready to hand directly to st.download_button(data=...).
+    """
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        wrote_any = False
+        for sheet_name, df in sheets.items():
+            if df is None:
+                continue
+            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+            wrote_any = True
+        if not wrote_any:
+            # st.download_button still needs valid bytes even if every sheet was skipped
+            # (e.g. pre-period average was zero for every available sheet).
+            pd.DataFrame({"Note": ["No data available for export."]}).to_excel(
+                writer, sheet_name="Data", index=False
+            )
+    return buffer.getvalue()
+
 def smape(actual, pred):
     denom = (np.abs(actual) + np.abs(pred)) / 2
     denom = np.where(denom == 0, 1e-8, denom)
@@ -4702,6 +4730,37 @@ def render_time_series_validation(mode: str):
             fig.update_layout(yaxis_title=y_label)
             st.plotly_chart(fig, width='stretch')
 
+            # ---- Data export (xlsx): Plotly's own modebar only exports a PNG snapshot
+            # of the chart, not the underlying data, so this is a separate download
+            # button. Independent of whichever plot_type is currently toggled above —
+            # always includes both an "Actual" sheet and an "Indexed" sheet computed
+            # fresh here, so the export doesn't depend on the user's current toggle
+            # selection. ----
+            _actual_export_df = pd.DataFrame({
+                "Date": all_dates,
+                "Actual": all_actual,
+                "Predicted / Counterfactual": all_pred,
+            })
+            _pre_mean_export = np.mean(res['y_pre'])
+            if _pre_mean_export > 0:
+                _indexed_export_df = pd.DataFrame({
+                    "Date": all_dates,
+                    "Actual": np.array(all_actual) / _pre_mean_export * 100,
+                    "Predicted / Counterfactual": np.array(all_pred) / _pre_mean_export * 100,
+                })
+            else:
+                _indexed_export_df = None
+            st.download_button(
+                "⬇️ Download chart data (.xlsx)",
+                data=build_chart_data_xlsx({
+                    "Actual": _actual_export_df,
+                    "Indexed (pre-period avg=100)": _indexed_export_df,
+                }),
+                file_name=f"{method_name}_{title_suffix.split(' ')[0].lower()}_chart_data.xlsx".replace(" ", "_"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_chart_data_{mode_prefix}_{method_name}"
+            )
+
         # ---- Method Comparison table (traffic-light diagnostics), captions, and
         # interpretation help — rendered by a standalone, independently testable function. ----
         render_method_comparison_table(results, mode, test_start, control_regions_val)
@@ -5255,6 +5314,23 @@ with tab4:
                 "Interval Type": interval_type_b,
             })
 
+            _interval_cols_export = [
+                "Actual", "Counterfactual (mean)",
+                "Lower 94% Fitted Mean Interval", "Upper 94% Fitted Mean Interval",
+                "Lower 94% Predictive Interval", "Upper 94% Predictive Interval",
+            ]
+            # ---- Export copies, captured here (before the toggle below mutates plot_df
+            # in place) so the xlsx download always includes both an "Actual" sheet and
+            # an "Indexed" sheet regardless of which plot_type is currently toggled. ----
+            _actual_export_df_b = plot_df.copy()
+            _pre_mean_export_b = np.mean(bayes['y_pre'])
+            if _pre_mean_export_b > 0:
+                _indexed_export_df_b = plot_df.copy()
+                for _col in _interval_cols_export:
+                    _indexed_export_df_b[_col] = _indexed_export_df_b[_col] / _pre_mean_export_b * 100
+            else:
+                _indexed_export_df_b = None
+
             bayes_plot_type = st.radio(
                 "Display plot:",
                 ["Actual", "Indexed (pre‑period avg = 100)"],
@@ -5335,6 +5411,16 @@ with tab4:
                 fig_line.add_vline(x=bayes['test_end_ts'], line_dash="dash", line_color="orange", annotation_text="Test end", annotation_position="top right")
             fig_line.update_layout(yaxis_title=y_label)
             st.plotly_chart(fig_line, width='stretch')
+            st.download_button(
+                "⬇️ Download chart data (.xlsx)",
+                data=build_chart_data_xlsx({
+                    "Actual": _actual_export_df_b,
+                    "Indexed (pre-period avg=100)": _indexed_export_df_b,
+                }),
+                file_name="bayesian_tbr_chart_data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_bayes_chart_data"
+            )
             st.caption(
                 "**Blue** (pre-period) = uncertainty in the average fitted relationship, no noise added. "
                 "**Green** (test/post) = the plausible range of actual outcomes if there had been no test, "
@@ -5357,6 +5443,15 @@ with tab4:
             fig_b.add_vline(x=bayes['uplift_pi_upper'], line_dash="dot", line_color="green", annotation_text="94% upper (predictive)", annotation_position="top")
             fig_b.add_vline(x=bayes['mean_uplift'], line_dash="solid", line_color="blue", annotation_text=f"Mean = {bayes['mean_uplift']:.0f}", annotation_position="top")
             st.plotly_chart(fig_b, width='stretch')
+            st.download_button(
+                "⬇️ Download chart data (.xlsx)",
+                data=build_chart_data_xlsx({
+                    "Posterior Uplift Distribution": pd.DataFrame({"Uplift": bayes['uplift_samples']}),
+                }),
+                file_name="posterior_uplift_distribution_data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_posterior_uplift_data"
+            )
             st.caption("The histogram shows the distribution of possible uplift values, drawn from the posterior predictive counterfactual totals. The blue line marks the mean estimate, red is zero (no effect), and the green dashed lines show the 94% predictive interval.")
 
             _bayes_lag_drop_meta = bayes.get("lag_drop_metadata")
