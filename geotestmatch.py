@@ -418,12 +418,12 @@ def combine_reliability_ratings(component_ratings):
     """
     symbols = [v.split(" ", 1)[0] for v in component_ratings.values() if v]
     if any(s == "🔴" for s in symbols):
-        return "Weak"
+        return "❌ Weak"
     if any(s == "🟡" for s in symbols):
-        return "Caution"
+        return "⚠️ Caution"
     available = [s for s in symbols if s != "⚪"]
     if available and all(s == "🟢" for s in available):
-        return "Strong"
+        return "✅ Strong"
     return "Insufficient data"
 
 def get_reliability_drivers(component_ratings):
@@ -3166,9 +3166,9 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         {"Metric": "Median Placebo Uplift", "key": "median_placebo_uplift_pct"},
         {"Metric": "95% Placebo Uplift Range", "key": "placebo_range_pct"},
 
-        {"Metric": "G. OVERALL RELIABILITY", "is_section": True},
-        {"Metric": "Counterfactual Reliability", "key": "counterfactual_reliability"},
-        {"Metric": "Reliability Drivers", "key": "reliability_drivers"},
+        {"Metric": "G. OVERALL COUNTERFACTUAL ASSESSMENT", "is_section": True},
+        {"Metric": "Counterfactual Confidence", "key": "counterfactual_reliability"},
+        {"Metric": "Key Issues", "key": "reliability_drivers"},
 
     ]
     show_test_impact = (mode == "Evaluate" and test_start is not None)
