@@ -12,6 +12,7 @@ import warnings
 import unicodedata
 import io
 import re
+import datetime
 # pymc and arviz imported lazily inside the Bayesian tab to avoid
 # segfaults and Numba errors at startup on Python 3.14
 
@@ -191,21 +192,49 @@ def load_and_reshape_kpi(uploaded_file, agg_col=None, metric_col=None):
     df_long = df_long.dropna(subset=["kpi"])
     return df_long
 
-def build_region_mapping(df_long, valid_regions, adobe_to_geo):
+def kpi_pattern_scores(test_mean_series, candidates_wide_indexed):
     """
-    Maps each raw region string in df_long['region_raw'] to a canonical geo_col region
-    name, via adobe_to_geo (Adobe Analytics raw name -> canonical name) first, falling
-    back to a direct match against valid_regions.
+    For each candidate region's indexed weekly series (rows of candidates_wide_indexed,
+    already indexed to that region's own average = 100), computes correlation and mean
+    absolute distance versus the test group's mean indexed series. Both are comparable
+    across regions of very different raw volume, since everything is already indexed.
+    Returns a DataFrame with columns: region, correlation, distance.
+    """
+    rows = []
+    test_vals = test_mean_series.values.astype(float)
+    test_std = np.std(test_vals)
+    for region, row in candidates_wide_indexed.iterrows():
+        cand_vals = row.values.astype(float)
+        if test_std == 0 or np.std(cand_vals) == 0:
+            corr = np.nan
+        else:
+            corr = float(np.corrcoef(cand_vals, test_vals)[0, 1])
+        distance = float(np.mean(np.abs(cand_vals - test_vals)))
+        rows.append({"region": region, "correlation": corr, "distance": distance})
+    return pd.DataFrame(rows)
 
-    valid_regions should be the FULL candidate universe (e.g. agg_df[geo_col].unique()),
-    not just the test+selected-control regions. Passing only the already-selected
-    regions here was a bug: it silently capped every downstream method's candidate pool
-    to whatever was already chosen in the Region Matching tab, so "Data-Optimised
-    Controls" (which is meant to search ALL non-test regions and let LASSO pick which
-    ones matter) could never actually see any region beyond the ones already selected —
-    it wasn't optimising over anything.
+def rank_kpi_pattern_candidates(scores_df, correlation_weight):
     """
-    all_geomatch_regions = set(valid_regions)
+    Combines correlation and distance (see kpi_pattern_scores()) into a single
+    composite score in [0, 1], higher = better match, weighted by correlation_weight
+    (0 = rank purely on distance, 1 = rank purely on correlation) — mirrors the
+    existing feature-weight sliders used for demographic structural matching, applied
+    here to KPI pattern similarity instead.
+    """
+    df = scores_df.copy()
+    df["norm_corr"] = df["correlation"].fillna(-1).apply(lambda c: (c + 1) / 2)
+    d_min, d_max = df["distance"].min(), df["distance"].max()
+    if d_max > d_min:
+        df["norm_inv_distance"] = 1 - (df["distance"] - d_min) / (d_max - d_min)
+    else:
+        df["norm_inv_distance"] = 1.0
+    df["composite_score"] = (
+        correlation_weight * df["norm_corr"] + (1 - correlation_weight) * df["norm_inv_distance"]
+    )
+    return df.sort_values("composite_score", ascending=False).reset_index(drop=True)
+
+def build_region_mapping(df_long, test_regions_val, control_regions_val, adobe_to_geo):
+    all_geomatch_regions = set(test_regions_val + control_regions_val)
     df_long["region_clean"] = df_long["region_raw"].astype(str).str.strip()
     df_long["mapped_geo"] = df_long["region_clean"].map(adobe_to_geo)
     def final_region_name(row):
@@ -1431,12 +1460,38 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     # the test series or a selected control had missing KPI values for some dates. ----
     _warn_on_row_loss(matrix_diagnostics)
 
+    # ---- Guard against a mismatch between the requested control_list and the columns
+    # actually present in model_full. build_model_matrix() pivots control KPI values into
+    # columns, and any control with no matching rows for this date range (e.g. missing/
+    # all-NaN KPI data, or a naming mismatch between structural and KPI pattern region
+    # labels) simply won't appear as a column — it's silently absent, not NaN. Using the
+    # full, unfiltered control_list downstream (either directly, or inside
+    # add_lagged_control_features()) would then index columns that don't exist and raise
+    # a KeyError. Filter to only the controls actually present before proceeding, for both
+    # structural and KPI pattern matching. ----
+    control_list_present = [c for c in control_list if c in model_full.columns]
+    control_list_missing = [c for c in control_list if c not in model_full.columns]
+    if control_list_missing:
+        st.warning(
+            f"{len(control_list_missing)} control region(s) had no matching KPI data for the selected "
+            f"date range and were excluded from the model: {', '.join(map(str, control_list_missing))}. "
+            "This can happen if a region's KPI values are missing for this period, or if its name doesn't "
+            "match between the matching setup and the uploaded KPI file."
+        )
+    if not control_list_present:
+        st.error(
+            "No selected control regions have usable KPI data for the selected pre-period. "
+            "Check that the uploaded KPI file's region names match the ones used in Region Matching, "
+            "and that the selected date range has data for at least one control region."
+        )
+        return None
+
     if include_lagged_controls:
         model_full, model_feature_cols, lagged_feature_map, lag_drop_metadata = add_lagged_control_features(
-            model_full, control_list, lags=(lag_periods,), frequency_config=frequency_config
+            model_full, control_list_present, lags=(lag_periods,), frequency_config=frequency_config
         )
     else:
-        model_feature_cols = list(control_list)
+        model_feature_cols = list(control_list_present)
         lagged_feature_map = {}
         lag_drop_metadata = None
 
@@ -1445,6 +1500,21 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     model_pre = model_full[pre_mask].sort_values("date").reset_index(drop=True)
     if len(model_pre) < 6:
         return None
+
+    # ---- Final safety check: confirm every selected feature column genuinely exists in
+    # model_pre before indexing, rather than letting pandas raise an opaque KeyError. ----
+    _missing_feature_cols = [c for c in model_feature_cols if c not in model_pre.columns]
+    if _missing_feature_cols:
+        st.error(
+            f"Internal error: {len(_missing_feature_cols)} model feature column(s) were not found in the "
+            f"pre-period data ({', '.join(map(str, _missing_feature_cols))}). Please re-check your region "
+            "matching setup and the uploaded KPI file, then try again."
+        )
+        return None
+    if not model_feature_cols:
+        st.error("No usable model features were found for the selected pre-period. Please review your control group and date range.")
+        return None
+
     X_pre = model_pre[model_feature_cols].values
     y_pre = model_pre["test_kpi"].values
     dates_pre = model_pre["date"].tolist()
@@ -2372,199 +2442,49 @@ except Exception as e:
 _default_market_index = available_markets.index("UK") if "UK" in available_markets else 0
 
 with st.sidebar:
-    st.header("Matching Method")
-    matching_method = st.radio(
-        "Matching method", ["Structural", "KPI Pattern"], key="matching_method_sidebar",
-        on_change=reset_results,
-        help="**Structural** matches test/control regions on demographic profile (age, income, etc.) "
-             "from the built-in population dataset.\n\n"
-             "**KPI Pattern** matches regions on the shape of their own historical KPI trend instead — "
-             "use this when demographic data for your regions (e.g. custom TV/zip-code-derived regions) "
-             "isn't readily available."
-    )
-    kpi_pattern_mode = (matching_method == "KPI Pattern")
-    st.session_state["kpi_pattern_mode"] = kpi_pattern_mode
+    st.header("1. Geography")
+    market = st.selectbox("Market", available_markets, index=_default_market_index, on_change=reset_results,
+                          help="Select the market whose regions you want to use for geo-testing.")
+
+try:
+    market_df_raw = load_market_sheet(DATA_PATH, market)
+    market_df = prepare_market_dataframe(market_df_raw)
+    grouping_options = get_grouping_columns(market_df)
+except Exception as e:
+    st.error(f"We couldn't prepare the data for market '{market}'. Please check that this market's sheet is formatted correctly.")
+    with st.expander("Technical details"):
+        st.code(f"{type(e).__name__}: {e}")
+    st.stop()
+
+with st.sidebar:
+    geography_level = st.selectbox("Geography Level", grouping_options, on_change=reset_results,
+                                   help="The geographic unit to match on — e.g. region, state, or city.")
     st.write("---")
+    st.header("2. Matching Strategy")
+    strategy_labels = {
+        "Basic (Fast)": "Greedy (Nearest Neighbor)",
+        "Intermediate (Balanced)": "Refined Greedy (Hill Climbing)",
+        "Advanced (Thorough)": "Stochastic (Genetic Search)",
+    }
+    strategy_choice = st.radio("Strategy", list(strategy_labels.keys()), index=0, on_change=reset_results,
+                               help="Controls how thoroughly GeoMatch searches for the best control group.\n\n"
+                                    "**Basic** uses nearest-neighbour matching — fast but may miss better combinations.\n\n"
+                                    "**Intermediate** refines the nearest-neighbour result by trying local swaps.\n\n"
+                                    "**Advanced** uses stochastic swap search across many candidate combinations. It is slower than Intermediate, but explores more possible control groups without exhaustively testing every combination.")
+    match_mode = strategy_labels[strategy_choice]
 
-    kpi_pattern_file = None
-    kpi_pattern_agg_col = None
-    kpi_pattern_metric_value = None
-    kpi_pattern_date_range = None
+# ------------------------------------------------------------
+# Aggregate selected market
+# ------------------------------------------------------------
+geo_col = geography_level
+active_features = get_numeric_metric_columns(market_df, grouping_options)
 
-    if not kpi_pattern_mode:
-        st.header("1. Geography")
-        market = st.selectbox("Market", available_markets, index=_default_market_index, on_change=reset_results,
-                              help="Select the market whose regions you want to use for geo-testing.")
-    else:
-        st.header("1. Data Source")
-        kpi_pattern_file = st.file_uploader(
-            "Upload aggregated KPI file", type=["xlsx"], key="kpi_pattern_sidebar_uploader",
-            help="Column 1: raw key, not used (e.g. postcode). Columns 2..N-1: aggregation levels "
-                 "(e.g. TV Market, TV Region). One column named 'Metric': metric name. Remaining "
-                 "columns: one per date (weekly or daily).",
-            on_change=reset_results
-        )
-        market = "KPI Pattern"
-        if kpi_pattern_file is not None:
-            try:
-                _kp_peek = pd.read_excel(kpi_pattern_file, engine="calamine", header=0)
-            except Exception:
-                kpi_pattern_file.seek(0)
-                _kp_peek = pd.read_excel(kpi_pattern_file, engine="openpyxl", header=0)
-            kpi_pattern_file.seek(0)
-            _kp_date_cols = detect_date_columns(_kp_peek)
-            _kp_non_date_cols = [c for c in _kp_peek.columns if c not in _kp_date_cols]
-            if len(_kp_non_date_cols) < 3 or not _kp_date_cols:
-                st.error("File format not recognized — need a raw-key column, at least one aggregation-level "
-                         "column, a metric column, and date columns.")
-            else:
-                _kp_metric_col = detect_metric_column(_kp_non_date_cols)
-                if _kp_metric_col is None:
-                    st.error("Couldn't find a column named 'Metric'. Please rename your metric-name column to 'Metric'.")
-                else:
-                    st.session_state["kpi_pattern_metric_col"] = _kp_metric_col
-                    _kp_agg_candidates = [c for c in _kp_non_date_cols[1:] if c != _kp_metric_col]
-                    kpi_pattern_agg_col = st.selectbox(
-                        "Aggregation level", _kp_agg_candidates, key="kpi_pattern_agg_col_sidebar",
-                        on_change=reset_results,
-                        help="Which column to group and sum by — this becomes your geography level for matching."
-                    )
-                    _kp_metric_values = sorted(_kp_peek[_kp_metric_col].dropna().unique().tolist())
-                    kpi_pattern_metric_value = st.selectbox(
-                        "Metric", _kp_metric_values, key="kpi_pattern_metric_value_sidebar", on_change=reset_results
-                    )
-                    _kp_dates_sorted = sorted(_kp_date_cols)
-                    kpi_pattern_date_range = st.select_slider(
-                        "Date range", options=_kp_dates_sorted,
-                        value=(_kp_dates_sorted[0], _kp_dates_sorted[-1]),
-                        format_func=lambda d: d.strftime("%d %b %y"),
-                        key="kpi_pattern_date_range_sidebar", on_change=reset_results
-                    )
+agg_df = aggregate_market_data(market_df=market_df, grouping_col=geo_col, numeric_metric_cols=active_features)
+agg_df = impute_missing_features(agg_df, active_features)
+agg_df = agg_df.dropna(subset=[geo_col, POPULATION_COL])
+agg_df = agg_df[agg_df[POPULATION_COL] > 0]
 
-if not kpi_pattern_mode:
-    try:
-        market_df_raw = load_market_sheet(DATA_PATH, market)
-        market_df = prepare_market_dataframe(market_df_raw)
-        grouping_options = get_grouping_columns(market_df)
-    except Exception as e:
-        st.error(f"We couldn't prepare the data for market '{market}'. Please check that this market's sheet is formatted correctly.")
-        with st.expander("Technical details"):
-            st.code(f"{type(e).__name__}: {e}")
-        st.stop()
-
-    with st.sidebar:
-        geography_level = st.selectbox("Geography Level", grouping_options, on_change=reset_results,
-                                       help="The geographic unit to match on — e.g. region, state, or city.")
-        st.write("---")
-        st.header("2. Matching Strategy")
-        strategy_labels = {
-            "Basic (Fast)": "Greedy (Nearest Neighbor)",
-            "Intermediate (Balanced)": "Refined Greedy (Hill Climbing)",
-            "Advanced (Thorough)": "Stochastic (Genetic Search)",
-        }
-        strategy_choice = st.radio("Strategy", list(strategy_labels.keys()), index=0, on_change=reset_results,
-                                   help="Controls how thoroughly GeoMatch searches for the best control group.\n\n"
-                                        "**Basic** uses nearest-neighbour matching — fast but may miss better combinations.\n\n"
-                                        "**Intermediate** refines the nearest-neighbour result by trying local swaps.\n\n"
-                                        "**Advanced** uses stochastic swap search across many candidate combinations. It is slower than Intermediate, but explores more possible control groups without exhaustively testing every combination.")
-        match_mode = strategy_labels[strategy_choice]
-
-    # ------------------------------------------------------------
-    # Aggregate selected market
-    # ------------------------------------------------------------
-    geo_col = geography_level
-    active_features = get_numeric_metric_columns(market_df, grouping_options)
-
-    agg_df = aggregate_market_data(market_df=market_df, grouping_col=geo_col, numeric_metric_cols=active_features)
-    agg_df = impute_missing_features(agg_df, active_features)
-    agg_df = agg_df.dropna(subset=[geo_col, POPULATION_COL])
-    agg_df = agg_df[agg_df[POPULATION_COL] > 0]
-
-    total_market_pop = agg_df[POPULATION_COL].sum()
-else:
-    with st.sidebar:
-        st.write("---")
-        st.header("2. Matching Strategy")
-        strategy_labels = {
-            "Basic (Fast)": "Greedy (Nearest Neighbor)",
-            "Intermediate (Balanced)": "Refined Greedy (Hill Climbing)",
-            "Advanced (Thorough)": "Stochastic (Genetic Search)",
-        }
-        strategy_choice = st.radio("Strategy", list(strategy_labels.keys()), index=0, on_change=reset_results,
-                                   help="Controls how thoroughly GeoMatch searches for the best control group.\n\n"
-                                        "**Basic** uses nearest-neighbour matching — fast but may miss better combinations.\n\n"
-                                        "**Intermediate** refines the nearest-neighbour result by trying local swaps.\n\n"
-                                        "**Advanced** uses stochastic swap search across many candidate combinations. It is slower than Intermediate, but explores more possible control groups without exhaustively testing every combination.")
-        match_mode = strategy_labels[strategy_choice]
-
-    if kpi_pattern_file is None or kpi_pattern_agg_col is None or kpi_pattern_metric_value is None:
-        st.info("📂 Upload an aggregated KPI file and complete the selections in the sidebar to continue.")
-        st.stop()
-
-    kpi_pattern_file.seek(0)
-    try:
-        _kp_full = pd.read_excel(kpi_pattern_file, engine="calamine", header=0)
-    except Exception:
-        kpi_pattern_file.seek(0)
-        _kp_full = pd.read_excel(kpi_pattern_file, engine="openpyxl", header=0)
-    _kp_metric_col_full = st.session_state["kpi_pattern_metric_col"]
-    _kp_date_cols_full = detect_date_columns(_kp_full)
-    _kp_dates_in_range = [d for d in sorted(_kp_date_cols_full) if kpi_pattern_date_range[0] <= d <= kpi_pattern_date_range[1]]
-    if len(_kp_dates_in_range) < 2:
-        st.error("Select a wider date range in the sidebar — at least 2 dates are needed.")
-        st.stop()
-
-    _kp_filtered = _kp_full[_kp_full[_kp_metric_col_full] == kpi_pattern_metric_value].copy()
-    _kp_n_before_drop = len(_kp_filtered)
-    # ---- Drop rows with a blank aggregation-level cell BEFORE aggregating, so
-    # unmapped/unclassified raw keys never silently inflate another region's total. ----
-    _kp_filtered = _kp_filtered.dropna(subset=[kpi_pattern_agg_col])
-    _kp_filtered = _kp_filtered[_kp_filtered[kpi_pattern_agg_col].astype(str).str.strip() != ""]
-    _kp_n_dropped = _kp_n_before_drop - len(_kp_filtered)
-
-    if _kp_filtered.empty:
-        st.error("No rows remain after filtering. Check your metric/aggregation-level/date-range selection.")
-        st.stop()
-
-    _kp_wide_raw = _kp_filtered.groupby(kpi_pattern_agg_col)[_kp_dates_in_range].sum()
-    _kp_wide_raw = _kp_wide_raw[_kp_wide_raw.sum(axis=1) > 0]  # drop all-zero regions (can't index)
-    if _kp_wide_raw.empty:
-        st.error("No regions with non-zero data in this range.")
-        st.stop()
-
-    # Index each region to its own mean over the selected range = 100, for pattern matching —
-    # this is what makes "distance" comparable across regions of very different raw KPI volume.
-    _kp_row_means = _kp_wide_raw.mean(axis=1)
-    _kp_wide_indexed = _kp_wide_raw.div(_kp_row_means, axis=0) * 100
-    _kp_wide_indexed = _kp_wide_indexed.dropna(how="any")
-
-    geography_level = kpi_pattern_agg_col
-    geo_col = geography_level
-    active_features = [f"wk_{d.strftime('%Y%m%d')}" for d in _kp_dates_in_range]
-    agg_df = _kp_wide_indexed.reset_index().rename(columns={kpi_pattern_agg_col: geo_col})
-    agg_df.columns = [geo_col] + active_features
-    # POPULATION_COL is aliased here to mean "total KPI volume over the selected range" rather
-    # than population — this is what "Test/Control Population Share" measures throughout the
-    # matching UI below; user-facing labels for this are adjusted where they'd otherwise say
-    # "population" (see kpi_share_label() and its call sites).
-    agg_df[POPULATION_COL] = [_kp_wide_raw.loc[r].sum() for r in _kp_wide_indexed.index]
-    total_market_pop = agg_df[POPULATION_COL].sum()
-
-    st.session_state["kpi_pattern_wide_raw"] = _kp_wide_raw
-    st.session_state["kpi_pattern_metric_value"] = kpi_pattern_metric_value
-    st.session_state["kpi_pattern_dates_in_range"] = _kp_dates_in_range
-
-    if _kp_n_dropped > 0:
-        st.caption(f"ℹ️ {_kp_n_dropped} row(s) dropped: blank '{kpi_pattern_agg_col}' value.")
-
-def kpi_share_label(base_label):
-    """Relabels a "...Population..." string to "...Share of {metric}..." when in KPI Pattern
-    mode, since POPULATION_COL is aliased to total KPI volume (not population) in that mode.
-    Structural mode returns base_label unchanged."""
-    if not st.session_state.get("kpi_pattern_mode"):
-        return base_label
-    metric_label = st.session_state.get("kpi_pattern_metric_value", "KPI")
-    return base_label.replace("population", metric_label).replace("Population", metric_label)
+total_market_pop = agg_df[POPULATION_COL].sum()
 
 # Data quality check – also warn about high missingness in features
 validation_issues, recommendations = validate_data(agg_df, active_features, geo_col=geo_col, market=market, level=geography_level)
@@ -2647,9 +2567,9 @@ def render_structural_matching_tab():
             if test_geos:
                 test_pop_pct = calculate_experiment_population_coverage(test_geos, agg_df, geo_col, total_market_pop)
                 st.metric(
-                    kpi_share_label("Test group market population included"),
+                    "Test group market population included",
                     f"{test_pop_pct:.1f}%",
-                    help=kpi_share_label("Percentage of the total market population covered by the selected test regions.")
+                    help="Percentage of the total market population covered by the selected test regions."
                 )
             force_exp_include = []
             force_exp_exclude = []
@@ -2672,9 +2592,9 @@ def render_structural_matching_tab():
             if test_geos:
                 test_pop_pct = calculate_experiment_population_coverage(test_geos, agg_df, geo_col, total_market_pop)
                 st.metric(
-                    kpi_share_label("Test group market population included"),
+                    "Test group market population included",
                     f"{test_pop_pct:.1f}%",
-                    help=kpi_share_label("Percentage of the total market population covered by the selected test geographies. Larger test groups are typically more representative of the overall market, but leave fewer regions available for control selection.")
+                    help="Percentage of the total market population covered by the selected test geographies. Larger test groups are typically more representative of the overall market, but leave fewer regions available for control selection."
                 )
             force_exp_include = []
             force_exp_exclude = []
@@ -2872,19 +2792,11 @@ def render_structural_matching_tab():
                 st.session_state.w_reset += 1
                 st.rerun()
         with preset_col2:
-            if st.button("👴 Older Pop. Focus (50+)", width='stretch', key="senior_focus"):
-                for f in active_features:
-                    st.session_state.current_weights[f] = 1
-                for f in active_features:
-                    if "50-64" in f or "65+" in f or "65 plus" in f.lower():
-                        st.session_state.current_weights[f] = 8
+            if st.button("Reset Slider Positions", width='stretch', key="reset_sliders"):
                 st.session_state.w_reset += 1
                 st.rerun()
-        if st.button("Reset Slider Positions", width='stretch', key="reset_sliders"):
-            st.session_state.w_reset += 1
-            st.rerun()
         weights = {}
-        with st.expander(kpi_share_label("Demographic Importance Weights") if not st.session_state.get("kpi_pattern_mode") else "Weekly Pattern Importance Weights", expanded=False):
+        with st.expander("Demographic Importance Weights", expanded=False):
             search_term = st.text_input("🔍 Filter features", placeholder="Type to search...", key=f"weight_search_{st.session_state.w_reset}")
             ordered_features = active_features.copy()
             if search_term:
@@ -3297,11 +3209,11 @@ def render_structural_matching_tab():
             with ck3:
                 st.metric("Control Group Size", control_group_size, help="Number of control regions selected in the last completed run.")
             with ck4:
-                st.metric(kpi_share_label("Test Population Share"), f"{experiment_pop_pct:.1f}%", help=kpi_share_label("Percentage of total market population covered by the test regions used in the last completed run."))
+                st.metric("Test Population Share", f"{experiment_pop_pct:.1f}%", help="Percentage of total market population covered by the test regions used in the last completed run.")
                 if st.session_state.guided_share_info:
                     st.caption(f"Target: {st.session_state.guided_share_info['target']}%")
             with ck5:
-                st.metric(kpi_share_label("Control Population Share"), f"{control_pop_pct:.1f}%", help=kpi_share_label("Percentage of total market population covered by the control regions selected in the last completed run."))
+                st.metric("Control Population Share", f"{control_pop_pct:.1f}%", help="Percentage of total market population covered by the control regions selected in the last completed run.")
             st.caption("Weighted Structural Distance is the optimisation objective and uses the slider weights from the last completed run. Mean Abs SMD is an unweighted diagnostic balance check. These results are frozen until you click Run Match Analysis again.")
 
             with st.expander("View Selected Groups", expanded=True):
@@ -3327,11 +3239,34 @@ def render_structural_matching_tab():
                     else:
                         return "background-color: #ffc7ce"
                 display_comp = comp_df.copy()
+
+                def _format_feature_label(feat):
+                    """Reformat any date-like feature label (e.g. a KPI-pattern week
+                    column, or a raw date/Timestamp) as dd mmm yy for readability."""
+                    if isinstance(feat, (pd.Timestamp, datetime.date, datetime.datetime)):
+                        return pd.to_datetime(feat).strftime("%d %b %y")
+                    if isinstance(feat, str):
+                        _m = re.match(r"^(?:wk_|week_)?(\d{4})(\d{2})(\d{2})$", feat)
+                        if _m:
+                            try:
+                                return pd.Timestamp(f"{_m.group(1)}-{_m.group(2)}-{_m.group(3)}").strftime("%d %b %y")
+                            except (ValueError, TypeError):
+                                return feat
+                        # Only attempt generic date parsing for strings that already look
+                        # like a date (avoid misreading ordinary feature/demographic names).
+                        if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}$", feat) or re.match(r"^\d{1,2}[-/]\d{1,2}[-/]\d{4}$", feat):
+                            try:
+                                return pd.to_datetime(feat).strftime("%d %b %y")
+                            except (ValueError, TypeError):
+                                return feat
+                    return feat
+
+                display_comp["Feature"] = display_comp["Feature"].apply(_format_feature_label)
                 for c in ["Test Mean", "Ctrl Mean", "Raw Diff"]:
                     display_comp[c] = display_comp[c].astype(object)
                 prop_features = set(proportion_cols)
                 for idx, row in display_comp.iterrows():
-                    feat = row["Feature"]
+                    feat = comp_df.iloc[idx]["Feature"]
                     if feat in prop_features:
                         display_comp.at[idx, "Test Mean"] = f"{row['Test Mean'] * 100:.1f}%"
                         display_comp.at[idx, "Ctrl Mean"] = f"{row['Ctrl Mean'] * 100:.1f}%"
@@ -3460,15 +3395,393 @@ def render_structural_matching_tab():
             with col2:
                 if st.button("📋 Copy Summary to Clipboard", width='stretch'):
 
-                    summary_text = f"""GEO-MATCH RESULTS SUMMARY\n=========================\nMarket: {market}\nGeography Level: {geography_level}\nStrategy: {match_mode}\n----------------------------------------\nMean Abs SMD (unweighted diagnostic): {mean_abs_smd:.4f}\nWeighted Structural Distance (optimisation objective): {weighted_structural_distance:.4f}\nControl Group Size: {len(st.session_state.final_controls)}\nTest Group Size: {len(st.session_state.test_df)}\n{kpi_share_label("Test Population Share")}: {(experiment_pop / eligible_market_pop * 100):.1f}%\n{kpi_share_label("Control Population Share")}: {(control_pop / eligible_market_pop * 100):.1f}%"""
+                    summary_text = f"""GEO-MATCH RESULTS SUMMARY\n=========================\nMarket: {market}\nGeography Level: {geography_level}\nStrategy: {match_mode}\n----------------------------------------\nMean Abs SMD (unweighted diagnostic): {mean_abs_smd:.4f}\nWeighted Structural Distance (optimisation objective): {weighted_structural_distance:.4f}\nControl Group Size: {len(st.session_state.final_controls)}\nTest Group Size: {len(st.session_state.test_df)}\nTest Population Share: {(experiment_pop / eligible_market_pop * 100):.1f}%\nControl Population Share: {(control_pop / eligible_market_pop * 100):.1f}%"""
                     st.code(summary_text, language="text")
                     st.caption("Copy the text above manually")
 
+def render_kpi_pattern_matching_tab():
+    """
+    Alternative to render_structural_matching_tab() above, for cases where per-region
+    demographic data isn't readily available (e.g. custom TV/zip-code-derived regions).
+    Regions are matched on the SHAPE of their own historical KPI trend — each region's
+    weekly series indexed to its own average over the selected date range = 100 —
+    rather than static demographic features.
+
+    Populates st.session_state.test_df / final_controls with the same shape/contract
+    render_structural_matching_tab() uses (a `geo_col` column + POPULATION_COL + numeric
+    feature columns), so Tabs 2-4 (which read st.session_state.final_controls[geo_col]
+    directly) keep working unmodified regardless of which matching mode was used.
+    POPULATION_COL is aliased here to mean "total KPI volume over the selected range"
+    rather than population, and the chosen aggregation-level column's values are
+    aliased into a column literally named `geo_col` (the app's existing
+    geography_level string from the sidebar) purely for this compatibility — the
+    sidebar's Geography Level selector itself is not otherwise used in this mode.
+    """
+    st.info(
+        "This mode matches regions on the shape of their own historical KPI trend "
+        "(each region indexed to its own average = 100) instead of demographic profile. "
+        "Use this when demographic data for your regions isn't readily available."
+    )
+
+    if "kpi_pattern_raw_df" not in st.session_state:
+        st.session_state.kpi_pattern_raw_df = None
+
+    def _clear_kpi_pattern_upload():
+        st.session_state.kpi_pattern_raw_df = None
+        st.session_state.kpi_pattern_auto_controls = []
+        st.session_state.kpi_pattern_scores_display = None
+        reset_results()
+
+    uploaded = st.file_uploader(
+        "Upload aggregated KPI file",
+        type=["xlsx"],
+        key="kpi_pattern_uploader",
+        help="Column 1: raw key, not used (e.g. postcode). Columns 2..N-1: aggregation "
+             "levels (e.g. TV Market, TV Region). Column N: metric name. Remaining "
+             "columns: one per date (weekly or daily).",
+        on_change=_clear_kpi_pattern_upload
+    )
+    if uploaded is None:
+        st.info("📂 Upload an aggregated KPI Excel file to begin.")
+        return
+
+    if st.session_state.kpi_pattern_raw_df is None:
+        try:
+            df_raw_kp = pd.read_excel(uploaded, engine="calamine", header=0)
+        except Exception:
+            uploaded.seek(0)
+            df_raw_kp = pd.read_excel(uploaded, engine="openpyxl", header=0)
+        st.session_state.kpi_pattern_raw_df = df_raw_kp
+
+    df_raw_kp = st.session_state.kpi_pattern_raw_df
+    date_cols_kp = detect_date_columns(df_raw_kp)
+    non_date_cols_kp = [c for c in df_raw_kp.columns if c not in date_cols_kp]
+    if len(non_date_cols_kp) < 3 or len(date_cols_kp) == 0:
+        st.error(
+            "This file doesn't look like the expected format: at least a raw-key column, "
+            "one aggregation-level column, a metric column, and one or more date columns."
+        )
+        return
+
+    # First column = raw key (e.g. postcode), excluded from aggregation-level candidates.
+    agg_candidates_kp = list(non_date_cols_kp[1:])
+    default_metric_col_kp = detect_metric_column(non_date_cols_kp)
+    metric_col_kp = st.selectbox(
+        "Metric column",
+        agg_candidates_kp,
+        index=(agg_candidates_kp.index(default_metric_col_kp) if default_metric_col_kp in agg_candidates_kp else len(agg_candidates_kp) - 1),
+        key="kpi_pattern_metric_col",
+        help="Which column identifies the metric name (e.g. 'Metric')."
+    )
+    agg_col_options_kp = [c for c in agg_candidates_kp if c != metric_col_kp]
+    if not agg_col_options_kp:
+        st.error("No aggregation-level columns available — every non-date column besides the first is being used as the metric column.")
+        return
+    agg_col_kp = st.selectbox(
+        "Aggregation level",
+        agg_col_options_kp,
+        key="kpi_pattern_agg_col",
+        help="Which column to group and sum by — this becomes your geography level for matching."
+    )
+    metric_values_kp = sorted(df_raw_kp[metric_col_kp].dropna().unique().tolist())
+    metric_value_kp = st.selectbox("Metric", metric_values_kp, key="kpi_pattern_metric_value")
+
+    # ---- Drop rows with a blank aggregation-level cell BEFORE aggregating, so
+    # unmapped/unclassified raw keys never silently inflate another region's total. ----
+    df_filtered_kp = df_raw_kp[df_raw_kp[metric_col_kp] == metric_value_kp].copy()
+    n_before_drop = len(df_filtered_kp)
+    df_filtered_kp = df_filtered_kp.dropna(subset=[agg_col_kp])
+    df_filtered_kp = df_filtered_kp[df_filtered_kp[agg_col_kp].astype(str).str.strip() != ""]
+    n_dropped_kp = n_before_drop - len(df_filtered_kp)
+    if n_dropped_kp > 0:
+        st.caption(f"ℹ️ {n_dropped_kp} row(s) dropped: blank '{agg_col_kp}' value.")
+
+    if df_filtered_kp.empty:
+        st.warning("No rows remain after filtering. Check your metric/aggregation-level selection.")
+        return
+
+    all_dates_sorted_kp = sorted(date_cols_kp)
+    st.markdown("**Date range (pre-period only)**")
+    date_col_start, date_col_end = st.columns(2)
+    with date_col_start:
+        range_start_kp = st.selectbox(
+            "Start date",
+            all_dates_sorted_kp,
+            index=0,
+            format_func=lambda d: d.strftime("%d %b %y"),
+            key="kpi_pattern_date_start"
+        )
+    with date_col_end:
+        _end_options_kp = [d for d in all_dates_sorted_kp if d >= range_start_kp]
+        _default_end_kp = all_dates_sorted_kp[-1] if all_dates_sorted_kp[-1] in _end_options_kp else _end_options_kp[-1]
+        range_end_kp = st.selectbox(
+            "End date",
+            _end_options_kp,
+            index=_end_options_kp.index(_default_end_kp),
+            format_func=lambda d: d.strftime("%d %b %y"),
+            key=f"kpi_pattern_date_end_{range_start_kp}"
+        )
+    st.caption(
+        "ℹ️ This date range should cover the **pre-period only** — the history used to assess "
+        "how closely regions' KPI patterns track each other. It should exclude the test date range, "
+        "since including test-period data (which may already reflect the test effect) would bias the matching."
+    )
+    date_cols_in_range_kp = [d for d in all_dates_sorted_kp if range_start_kp <= d <= range_end_kp]
+    if len(date_cols_in_range_kp) < 2:
+        st.warning("Select a wider date range — at least 2 weeks are needed to assess pattern.")
+        return
+
+    # Aggregate: sum by aggregation level across the selected date range.
+    wide_raw_kp = df_filtered_kp.groupby(agg_col_kp)[date_cols_in_range_kp].sum()
+    wide_raw_kp = wide_raw_kp[wide_raw_kp.sum(axis=1) > 0]  # drop all-zero regions (can't index)
+    if wide_raw_kp.empty:
+        st.warning("No regions with non-zero data in this range.")
+        return
+
+    with st.expander(
+        f"Preview: {metric_value_kp} by {agg_col_kp} "
+        f"({range_start_kp.strftime('%d %b %y')} – {range_end_kp.strftime('%d %b %y')})",
+        expanded=False
+    ):
+        # Geography column labelled with the selected aggregation level (not a generic
+        # name), a KPI-total column labelled with the selected metric value rather than
+        # "Population", and date columns formatted as dd mmm yy for readability.
+        _kpi_total_label_kp = f"{metric_value_kp} Total" if metric_value_kp else "KPI Total"
+        _preview_kp = wide_raw_kp.reset_index()
+        _preview_kp.insert(1, _kpi_total_label_kp, wide_raw_kp.sum(axis=1).values)
+        _preview_kp = _preview_kp.rename(columns={d: d.strftime("%d %b %y") for d in date_cols_in_range_kp})
+        st.dataframe(_preview_kp, width='stretch', height=280, hide_index=True)
+
+    # Index each region to its own mean over the selected range = 100, for pattern matching.
+    row_means_kp = wide_raw_kp.mean(axis=1)
+    wide_indexed_kp = wide_raw_kp.div(row_means_kp, axis=0) * 100
+    wide_indexed_kp = wide_indexed_kp.dropna(how="any")
+
+    region_totals_kp = wide_raw_kp.sum(axis=1)  # stand-in for "population" = total KPI volume
+    total_kpi_kp = region_totals_kp.sum()
+    all_regions_kp = sorted(wide_indexed_kp.index.tolist())
+
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+    st.subheader("🧩 MATCHING SETUP (KPI Pattern)")
+    kpi_setup_mode = st.radio(
+        "Setup Mode",
+        ["Manual Selection (Pick Both)", "Pick Test, Auto‑Match Controls", "Set Rules & Auto‑Build Groups"],
+        horizontal=True,
+        key="kpi_pattern_setup_mode",
+        help="**Manual Selection** — you pick both groups directly.\n\n"
+             "**Pick Test, Auto‑Match Controls** — you choose test regions and the app ranks candidate "
+             "controls by how closely their historical pattern matches, weighted by correlation vs distance.\n\n"
+             "**Set Rules & Auto‑Build Groups** — set minimum correlation / maximum distance thresholds "
+             "and the app selects every region that passes."
+    )
+
+    region_labels_kp = {
+        r: f"{r} ({region_totals_kp[r] / total_kpi_kp * 100:.1f}% of {metric_value_kp})" for r in all_regions_kp
+    }
+    label_to_region_kp = {v: k for k, v in region_labels_kp.items()}
+
+    test_regions_kpi = []
+    control_regions_kpi = []
+
+    if kpi_setup_mode == "Manual Selection (Pick Both)":
+        col1, col2 = st.columns(2)
+        with col1:
+            test_labels_kp = st.multiselect("Test regions", list(region_labels_kp.values()), key="kpi_pattern_test_manual")
+            test_regions_kpi = [label_to_region_kp[l] for l in test_labels_kp]
+        with col2:
+            ctrl_options_kp = [region_labels_kp[r] for r in all_regions_kp if r not in test_regions_kpi]
+            ctrl_labels_kp = st.multiselect("Control regions", ctrl_options_kp, key="kpi_pattern_control_manual")
+            control_regions_kpi = [label_to_region_kp[l] for l in ctrl_labels_kp]
+
+    elif kpi_setup_mode == "Pick Test, Auto‑Match Controls":
+        test_labels_kp = st.multiselect("Test regions", list(region_labels_kp.values()), key="kpi_pattern_test_auto")
+        test_regions_kpi = [label_to_region_kp[l] for l in test_labels_kp]
+        col1, col2 = st.columns(2)
+        with col1:
+            corr_weight_kp = st.slider(
+                "Correlation weight (vs. distance)", 0.0, 1.0, 0.5, 0.05, key="kpi_pattern_corr_weight_auto",
+                help="0 = rank purely on how close in level/shape (distance); 1 = rank purely on how "
+                     "closely they move together over time (correlation)."
+            )
+        with col2:
+            _n_candidates_kp = max(1, len(all_regions_kp) - len(test_regions_kpi))
+            n_controls_kp = st.number_input(
+                "Number of controls to select", min_value=1, max_value=_n_candidates_kp,
+                value=min(5, _n_candidates_kp), key="kpi_pattern_n_controls"
+            )
+        if test_regions_kpi and st.button("🔎 Find Best Matches", key="kpi_pattern_find_matches"):
+            candidates_kp = [r for r in all_regions_kp if r not in test_regions_kpi]
+            if not candidates_kp:
+                st.warning("No candidate regions remain outside the test group.")
+            else:
+                test_mean_series_kp = wide_indexed_kp.loc[test_regions_kpi].mean(axis=0)
+                scores_kp = kpi_pattern_scores(test_mean_series_kp, wide_indexed_kp.loc[candidates_kp])
+                ranked_kp = rank_kpi_pattern_candidates(scores_kp, corr_weight_kp)
+                st.session_state.kpi_pattern_auto_controls = ranked_kp.head(int(n_controls_kp))["region"].tolist()
+                st.session_state.kpi_pattern_scores_display = ranked_kp
+        control_regions_kpi = st.session_state.get("kpi_pattern_auto_controls", []) or []
+        if st.session_state.get("kpi_pattern_scores_display") is not None:
+            with st.expander("Candidate ranking", expanded=False):
+                st.dataframe(st.session_state.kpi_pattern_scores_display, width='stretch')
+
+    else:  # "Set Rules & Auto‑Build Groups"
+        test_labels_kp = st.multiselect("Test regions", list(region_labels_kp.values()), key="kpi_pattern_test_rules")
+        test_regions_kpi = [label_to_region_kp[l] for l in test_labels_kp]
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            corr_weight_kp = st.slider("Correlation weight (vs. distance)", 0.0, 1.0, 0.5, 0.05, key="kpi_pattern_corr_weight_rules")
+        with col2:
+            min_corr_kp = st.slider("Minimum correlation", -1.0, 1.0, 0.5, 0.05, key="kpi_pattern_min_corr")
+        with col3:
+            max_dist_kp = st.slider(
+                "Maximum distance (index pts)", 1, 200, 30, 1, key="kpi_pattern_max_dist",
+                help="Mean absolute difference in indexed values (both series on a ~100-average scale) "
+                     "allowed vs the test group's average pattern."
+            )
+        if test_regions_kpi and st.button("🔎 Apply Rules", key="kpi_pattern_apply_rules"):
+            candidates_kp = [r for r in all_regions_kp if r not in test_regions_kpi]
+            if not candidates_kp:
+                st.warning("No candidate regions remain outside the test group.")
+            else:
+                test_mean_series_kp = wide_indexed_kp.loc[test_regions_kpi].mean(axis=0)
+                scores_kp = kpi_pattern_scores(test_mean_series_kp, wide_indexed_kp.loc[candidates_kp])
+                ranked_kp = rank_kpi_pattern_candidates(scores_kp, corr_weight_kp)
+                passing_kp = ranked_kp[(ranked_kp["correlation"] >= min_corr_kp) & (ranked_kp["distance"] <= max_dist_kp)]
+                st.session_state.kpi_pattern_auto_controls = passing_kp["region"].tolist()
+                st.session_state.kpi_pattern_scores_display = ranked_kp
+                if st.session_state.kpi_pattern_auto_controls == []:
+                    st.warning("No regions meet these rules. Loosen the thresholds.")
+        control_regions_kpi = st.session_state.get("kpi_pattern_auto_controls", []) or []
+        if st.session_state.get("kpi_pattern_scores_display") is not None:
+            with st.expander("Candidate ranking (✅ = passes current rules)", expanded=False):
+                disp_kp = st.session_state.kpi_pattern_scores_display.copy()
+                disp_kp["Passes rules"] = disp_kp["region"].isin(control_regions_kpi).map({True: "✅", False: ""})
+                st.dataframe(disp_kp, width='stretch')
+
+    if test_regions_kpi and control_regions_kpi:
+        overlap_kp = set(test_regions_kpi) & set(control_regions_kpi)
+        if overlap_kp:
+            st.error(f"These regions are in both groups: {', '.join(sorted(overlap_kp))}. Remove the overlap before continuing.")
+            return
+
+        st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+        st.subheader("Results")
+
+        test_kpi_share = region_totals_kp[test_regions_kpi].sum() / total_kpi_kp * 100
+        control_kpi_share = region_totals_kp[control_regions_kpi].sum() / total_kpi_kp * 100
+        c1, c2 = st.columns(2)
+        c1.metric(f"Test Group Share of {metric_value_kp}", f"{test_kpi_share:.1f}%")
+        c2.metric(f"Control Group Share of {metric_value_kp}", f"{control_kpi_share:.1f}%")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.write("**Test regions**")
+            st.table(pd.DataFrame({agg_col_kp: test_regions_kpi}))
+        with col_b:
+            st.write("**Control regions**")
+            st.table(pd.DataFrame({agg_col_kp: control_regions_kpi}))
+
+        test_mean_final_kp = wide_indexed_kp.loc[test_regions_kpi].mean(axis=0)
+        control_mean_final_kp = wide_indexed_kp.loc[control_regions_kpi].mean(axis=0)
+        fit_df_kp = pd.DataFrame({
+            "Date": date_cols_in_range_kp,
+            "Test group (indexed)": test_mean_final_kp.values,
+            "Control group (indexed)": control_mean_final_kp.values,
+        }).melt(id_vars="Date", var_name="Series", value_name="Indexed value")
+        fig_pattern_kp = px.line(
+            fit_df_kp, x="Date", y="Indexed value", color="Series",
+            title=f"Pattern fit — {metric_value_kp} (indexed to each region's own average = 100)"
+        )
+        st.plotly_chart(fig_pattern_kp, width='stretch')
+
+        # ---- Populate session state in the SAME shape render_structural_matching_tab()
+        # uses, so Tabs 2-4 keep working unmodified. POPULATION_COL is aliased to total
+        # KPI volume; geo_col is aliased to agg_col_kp's values (see docstring). ----
+        def _build_kpi_group_df(region_list):
+            gdf = wide_indexed_kp.loc[region_list].reset_index().rename(columns={agg_col_kp: geo_col})
+            gdf.columns = [geo_col] + [f"wk_{d.strftime('%Y%m%d')}" for d in date_cols_in_range_kp]
+            gdf[POPULATION_COL] = [region_totals_kp[r] for r in region_list]
+            return gdf
+
+        if st.button("✅ Use these groups", key="kpi_pattern_confirm", type="primary"):
+            st.session_state.test_df = _build_kpi_group_df(test_regions_kpi)
+            st.session_state.final_controls = _build_kpi_group_df(control_regions_kpi)
+            st.session_state.selected_experiment_regions = test_regions_kpi
+            st.success(
+                "Test and control groups set. Continue to the Validate Test Design tab, and re-upload "
+                "this same file there to select your KPI and date range for modelling."
+            )
+
+        st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+        with st.expander("📋 What will be exported?", expanded=False):
+            st.markdown(f"""
+            The export lists every region at the selected aggregation level with its test/control assignment:
+
+            - **{agg_col_kp}** — the aggregation level used for matching
+            - **Test Geography** — Yes if assigned to the test group
+            - **Control Geography** — Yes if assigned to the control group
+            """)
+        if st.button("📥 Export Matching Results to Excel", key="kpi_pattern_export", type="primary"):
+            try:
+                _test_geos_kp = set(str(g).strip() for g in test_regions_kpi)
+                _ctrl_geos_kp = set(str(g).strip() for g in control_regions_kpi)
+
+                _export_kp = pd.DataFrame({agg_col_kp: all_regions_kp})
+                _export_kp[agg_col_kp] = _export_kp[agg_col_kp].astype(str).str.strip()
+                _export_kp["Test Geography"] = _export_kp[agg_col_kp].apply(
+                    lambda g: "Yes" if g in _test_geos_kp else ""
+                )
+                _export_kp["Control Geography"] = _export_kp[agg_col_kp].apply(
+                    lambda g: "Yes" if g in _ctrl_geos_kp else ""
+                )
+                _export_kp = _export_kp.sort_values(agg_col_kp).reset_index(drop=True)
+
+                _output_kp = io.BytesIO()
+                with pd.ExcelWriter(_output_kp, engine="openpyxl") as writer:
+                    _export_kp.to_excel(writer, sheet_name="KPI_Pattern_Matching", index=False)
+                    ws = writer.sheets["KPI_Pattern_Matching"]
+                    for col_cells in ws.columns:
+                        max_len = max((len(str(c.value)) for c in col_cells if c.value), default=10)
+                        ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 60)
+
+                _n_test_kp = _export_kp["Test Geography"].eq("Yes").sum()
+                _n_ctrl_kp = _export_kp["Control Geography"].eq("Yes").sum()
+                st.download_button(
+                    label="Download Excel",
+                    data=_output_kp.getvalue(),
+                    file_name=f"kpi_pattern_matching_{agg_col_kp}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="kpi_pattern_download"
+                )
+                st.success(f"✅ Export ready — {len(_export_kp)} geographies, {_n_test_kp} test, {_n_ctrl_kp} control.")
+            except Exception as e:
+                st.error("We couldn't create the Excel export. Please try again, and check that both test and control groups have been selected.")
+                with st.expander("Technical details"):
+                    st.code(f"{type(e).__name__}: {e}")
+
 # =============================================================================
-# TAB 1: MATCHING SETUP
+# TAB 1: MATCHING SETUP — mode toggle between structural and KPI-pattern matching
 # =============================================================================
 with tab1:
-    render_structural_matching_tab()
+    st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+    st.subheader("🌐 Matching Data Source")
+    matching_data_source = st.radio(
+        "Matching data source",
+        ["Structural (Demographic)", "KPI Pattern (Aggregated Time Series)"],
+        horizontal=True,
+        key="matching_data_source_mode",
+        help="**Structural** matches test/control regions on demographic profile (age, income, etc.) "
+             "from the built-in population dataset.\n\n"
+             "**KPI Pattern** matches regions on the shape of their own historical KPI trend instead — "
+             "use this when demographic data for your regions (e.g. custom TV/zip-code-derived regions) "
+             "isn't readily available."
+    )
+    st.session_state["kpi_pattern_mode"] = (matching_data_source == "KPI Pattern (Aggregated Time Series)")
+
+    if st.session_state["kpi_pattern_mode"]:
+        render_kpi_pattern_matching_tab()
+    else:
+        render_structural_matching_tab()
 
 # =============================================================================
 # TAB 2: DESIGN FUTURE GEO TEST
@@ -3950,26 +4263,45 @@ def render_time_series_validation(mode: str):
     _kpi_agg_col = None
     _kpi_metric_col = None
     if len(_kpi_peek_non_date_cols) > 2:
-        st.markdown("**This file has multiple aggregation-level columns — pick which to use:**")
         _kpi_agg_candidates = list(_kpi_peek_non_date_cols[1:])
-        _kpi_default_metric = detect_metric_column(_kpi_peek_non_date_cols)
-        col_a, col_b = st.columns(2)
-        with col_a:
-            _kpi_metric_col = st.selectbox(
-                "Metric column", _kpi_agg_candidates,
-                index=(_kpi_agg_candidates.index(_kpi_default_metric) if _kpi_default_metric in _kpi_agg_candidates else len(_kpi_agg_candidates) - 1),
-                key=f"kpi_upload_metric_col_{mode_prefix}",
-                on_change=clear_uploaded_kpi_state
+        # If KPI Pattern matching was used in the Region Matching tab, the metric and
+        # aggregation-level columns are already known from that step — carry them
+        # forward instead of asking again, as long as they still exist in this file.
+        _carried_metric_col = st.session_state.get("kpi_pattern_metric_col")
+        _carried_agg_col = st.session_state.get("kpi_pattern_agg_col")
+        _can_carry_forward = (
+            st.session_state.get("kpi_pattern_mode", False)
+            and _carried_metric_col in _kpi_agg_candidates
+            and _carried_agg_col in _kpi_agg_candidates
+            and _carried_agg_col != _carried_metric_col
+        )
+        if _can_carry_forward:
+            _kpi_metric_col = _carried_metric_col
+            _kpi_agg_col = _carried_agg_col
+            st.caption(
+                f"ℹ️ Using **{_kpi_metric_col}** as the metric column and **{_kpi_agg_col}** as the "
+                f"aggregation level, carried forward from KPI Pattern matching setup."
             )
-        with col_b:
-            _kpi_agg_options = [c for c in _kpi_agg_candidates if c != _kpi_metric_col]
-            _kpi_agg_col = st.selectbox(
-                "Aggregation level", _kpi_agg_options,
-                key=f"kpi_upload_agg_col_{mode_prefix}",
-                help="Which column to group and sum by. For consistency, use the same aggregation "
-                     "level you matched on in the Region Matching tab.",
-                on_change=clear_uploaded_kpi_state
-            )
+        else:
+            st.markdown("**This file has multiple aggregation-level columns — pick which to use:**")
+            _kpi_default_metric = detect_metric_column(_kpi_peek_non_date_cols)
+            col_a, col_b = st.columns(2)
+            with col_a:
+                _kpi_metric_col = st.selectbox(
+                    "Metric column", _kpi_agg_candidates,
+                    index=(_kpi_agg_candidates.index(_kpi_default_metric) if _kpi_default_metric in _kpi_agg_candidates else len(_kpi_agg_candidates) - 1),
+                    key=f"kpi_upload_metric_col_{mode_prefix}",
+                    on_change=clear_uploaded_kpi_state
+                )
+            with col_b:
+                _kpi_agg_options = [c for c in _kpi_agg_candidates if c != _kpi_metric_col]
+                _kpi_agg_col = st.selectbox(
+                    "Aggregation level", _kpi_agg_options,
+                    key=f"kpi_upload_agg_col_{mode_prefix}",
+                    help="Which column to group and sum by. For consistency, use the same aggregation "
+                         "level you matched on in the Region Matching tab.",
+                    on_change=clear_uploaded_kpi_state
+                )
 
     if st.session_state.kpi_long_df is None:
         with st.spinner("Reading KPI file..."):
@@ -4510,24 +4842,15 @@ def render_time_series_validation(mode: str):
             st.stop()
 
         with st.spinner("Running validation models..."):
-            # ---- adobe_to_geo (raw Adobe Analytics name -> canonical geo_col name) only
-            # applies to the demographic/structural workflow, where uploaded KPI files may
-            # use different region spellings than the built-in population dataset. In KPI
-            # Pattern mode there's no such file to map against — the uploaded file's
-            # aggregation-level values ARE the canonical geo_col values already (that's
-            # what Region Matching built them from), so direct-match is sufficient. ----
-            if st.session_state.get("kpi_pattern_mode"):
-                adobe_to_geo = {}
-            else:
-                try:
-                    master_df = load_market_sheet(DATA_PATH, market)
-                    adobe_to_geo = dict(zip(
-                        master_df[ADOBE_COL].astype(str).str.strip(),
-                        master_df[geo_col].astype(str).str.strip()
-                    ))
-                except Exception as e:
-                    st.error(f"Failed to load region mapping: {e}")
-                    st.stop()
+            try:
+                master_df = load_market_sheet(DATA_PATH, market)
+                adobe_to_geo = dict(zip(
+                    master_df[ADOBE_COL].astype(str).str.strip(),
+                    master_df[geo_col].astype(str).str.strip()
+                ))
+            except Exception as e:
+                st.error(f"Failed to load region mapping: {e}")
+                st.stop()
 
             test_regions_val = st.session_state.selected_experiment_regions
             control_regions_val = st.session_state.final_controls[geo_col].tolist()
@@ -4541,12 +4864,7 @@ def render_time_series_validation(mode: str):
                 st.stop()
 
             df_long_raw = df_long_metric.copy()
-            # ---- Full candidate universe (every region GeoMatch knows about), NOT just
-            # test+selected-control — see build_region_mapping()'s docstring for why this
-            # matters: passing a smaller set here silently caps what "Data-Optimised
-            # Controls" can search over. ----
-            valid_regions_for_mapping = sorted(set(agg_df[geo_col].dropna().astype(str).str.strip().unique().tolist()) | set(test_regions_val) | set(control_regions_val))
-            df_long_mapped = build_region_mapping(df_long_raw, valid_regions_for_mapping, adobe_to_geo)
+            df_long_mapped = build_region_mapping(df_long_raw, test_regions_val, control_regions_val, adobe_to_geo)
             matched = df_long_mapped[df_long_mapped["region"].notna()]
             if matched.empty:
                 st.error("No regions matched. Check mapping table.")
