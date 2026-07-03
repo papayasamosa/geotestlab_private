@@ -38,6 +38,25 @@ def load_css(path: str = "styles.css") -> None:
 
 load_css()
 
+# ---- Smaller download buttons ----
+# Scoped to st.download_button() specifically (not st.button()), so the primary
+# action buttons (Run Match Analysis, Export to Excel, etc.) keep their current size
+# and only the download buttons (Excel export + the three chart-data downloads) shrink.
+# Added here inline rather than relying on styles.css, since that file isn't guaranteed
+# to be present in every environment.
+st.markdown("""
+<style>
+div[data-testid="stDownloadButton"] button {
+    font-size: 0.75rem;
+    padding: 0.15rem 0.6rem;
+    line-height: 1.3;
+}
+div[data-testid="stDownloadButton"] button p {
+    font-size: 0.75rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("TEST GeoTestLab")
 st.caption("Build statistically balanced test and control groups for geo-testing — no coding required.")
 
