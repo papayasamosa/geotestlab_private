@@ -1957,6 +1957,19 @@ def impute_missing_features(df: pd.DataFrame, feature_cols: List[str]) -> pd.Dat
             df[c] = df[c].fillna(median_val)
     return df
 
+@st.cache_data(ttl=CONFIG["cache_ttl"], show_spinner=False)
+def read_kpi_pattern_excel(file_bytes: bytes) -> pd.DataFrame:
+    """Parses the uploaded KPI Pattern workbook, cached on the file's raw bytes.
+    Streamlit reruns the whole script on every widget interaction, and this file was
+    previously parsed twice per rerun (sidebar peek + main tab) — with caching it is
+    parsed once per unique upload, no matter how many reruns occur."""
+    bio = io.BytesIO(file_bytes)
+    try:
+        return pd.read_excel(bio, engine="calamine", header=0)
+    except Exception:
+        bio.seek(0)
+        return pd.read_excel(bio, engine="openpyxl", header=0)
+
 # ------------------------------------------------------------
 # Matching metric helpers
 # ------------------------------------------------------------
@@ -2050,6 +2063,81 @@ def calculate_metrics_cached(test_df, control_df, features_tuple, weights_tuple,
     eligible_stds = dict(zip(features, eligible_stds_tuple))
     return calculate_metrics(test_df, control_df, features, weights_dict, eligible_means, eligible_stds)
 
+def make_fast_metrics_fn(pool_df, test_df_run, features, weights_dict, eligible_means, eligible_stds, population_col=POPULATION_COL):
+    """Builds a vectorised scorer for candidate control groups drawn from a FIXED pool.
+
+    Returns fast_metrics(idx_list) -> the same dict calculate_metrics() produces, where
+    idx_list contains pool_df index labels. The matching strategy loops call the metrics
+    function hundreds to thousands of times per run; calculate_metrics() pays for two
+    dataframe copies, per-feature median imputation (a no-op there — pool/test frames are
+    already imputed upstream), and per-feature Python loops on EVERY call. Here all of
+    that is hoisted: the feature matrix, population weights, eligible-basis arrays, and
+    the (constant) test profile are computed once, and each candidate is scored with a
+    handful of NumPy array ops.
+
+    The test profile is computed with the same weighted_profile() helper that
+    calculate_metrics() uses, and the control profile / SMD math mirrors it exactly, so
+    scores are numerically equivalent."""
+    features = [f for f in features if f in test_df_run.columns and f in pool_df.columns]
+    pos_map = {label: i for i, label in enumerate(pool_df.index)}
+    X = pool_df[features].to_numpy(dtype=float) if features else np.empty((len(pool_df), 0))
+
+    if population_col in pool_df.columns:
+        _pop_raw = pd.to_numeric(pool_df[population_col], errors="coerce")
+        pop_notna = _pop_raw.notna().to_numpy()
+        pop_filled = _pop_raw.fillna(0).to_numpy(dtype=float)
+    else:
+        pop_notna = None
+        pop_filled = None
+
+    test_imputed = impute_missing_features(test_df_run, features)
+    test_profile = weighted_profile(test_imputed, features, population_col).values if features else np.array([])
+
+    means_arr = np.array([eligible_means[f] for f in features], dtype=float)
+    stds_arr = np.array([eligible_stds[f] for f in features], dtype=float)
+    z_scale = np.where((stds_arr > 0) & np.isfinite(stds_arr), stds_arr, 1.0)
+    z_test = (test_profile - means_arr) / z_scale if features else np.array([])
+    w_vector = np.array([weights_dict.get(f, 1.0) for f in features])
+    valid_std = (stds_arr > 0) & np.isfinite(stds_arr)
+    safe_stds = np.where(valid_std, stds_arr, 1.0)
+
+    def fast_metrics(idx_list):
+        # Rare edge cases (no features / empty candidate group) defer to the reference
+        # implementation so behaviour is identical.
+        if not features or len(idx_list) == 0:
+            return calculate_metrics(test_df_run, pool_df.loc[list(idx_list)], features,
+                                     weights_dict, eligible_means, eligible_stds, population_col)
+        rows = [pos_map[i] for i in idx_list]
+        Xg = X[rows]
+        # Population-weighted control profile, with the same equal-weight fallback
+        # weighted_profile() applies when population is missing or sums to zero.
+        if pop_filled is not None and pop_notna[rows].any() and pop_filled[rows].sum() > 0:
+            w = pop_filled[rows]
+            control_profile = (Xg * w[:, None]).sum(axis=0) / w.sum()
+        else:
+            control_profile = Xg.mean(axis=0)
+
+        z_control = (control_profile - means_arr) / z_scale
+        sq_diff = (z_test - z_control) ** 2
+        weighted_contributions = w_vector * sq_diff
+        weighted_structural_distance = float(np.sqrt(np.sum(weighted_contributions)))
+
+        raw_diffs = test_profile - control_profile
+        smd_arr = np.where(valid_std, np.abs(raw_diffs) / safe_stds, np.nan)
+        mean_abs_smd = float(np.nanmean(smd_arr)) if smd_arr.size and not np.isnan(smd_arr).all() else (float("nan") if smd_arr.size else 0.0)
+
+        return {
+            "mean_abs_smd": mean_abs_smd,
+            "weighted_structural_distance": weighted_structural_distance,
+            "smd_list": smd_arr.tolist(),
+            "test_means": test_profile.copy(),
+            "control_means": control_profile,
+            "raw_diffs": raw_diffs,
+            "weighted_contributions": weighted_contributions,
+        }
+
+    return fast_metrics
+
 @st.cache_data(ttl=CONFIG["cache_ttl"])
 def preprocess_data(pool_df, test_df_run, active_features, weights, eligible_means_tuple, eligible_stds_tuple):
     """Nearest-neighbour candidate search uses the SAME fixed eligible-pool basis
@@ -2078,6 +2166,7 @@ def stochastic_genetic_search(
     nn_start_idx,
     n_iterations=1000,
     random_state=42,
+    fast_metrics_fn=None,
 ):
     """
     Stochastic (Genetic Search) — the "Advanced (Thorough)" matching strategy.
@@ -2088,9 +2177,13 @@ def stochastic_genetic_search(
     only). Swaps that improve the score are kept; the best group found is tracked and
     returned. Reproducible via a fixed random seed.
 
+    fast_metrics_fn: optional vectorised scorer from make_fast_metrics_fn() taking an
+    index-label list directly. When provided it replaces the per-candidate
+    calculate_metrics_fn call (same outputs, no per-call dataframe slicing/copying).
+
     Returns:
         best_idx: list of selected control indices for this n
-        best_metrics: the metrics dict for best_idx (from calculate_metrics_fn)
+        best_metrics: the metrics dict for best_idx (from the scoring function)
         evaluated_count: number of candidate groups scored during the search
         convergence: list of best Weighted Structural Distance values over the search
     """
@@ -2105,7 +2198,10 @@ def stochastic_genetic_search(
 
     def score(idx_list):
         nonlocal evaluated_count
-        metrics = calculate_metrics_fn(test_df_run, pool_df.loc[idx_list], active_features, weights, eligible_means, eligible_stds)
+        if fast_metrics_fn is not None:
+            metrics = fast_metrics_fn(idx_list)
+        else:
+            metrics = calculate_metrics_fn(test_df_run, pool_df.loc[idx_list], active_features, weights, eligible_means, eligible_stds)
         evaluated_count += 1
         return metrics["weighted_structural_distance"], metrics
 
@@ -2119,7 +2215,10 @@ def stochastic_genetic_search(
     best_metrics = current_metrics
 
     for _iteration in range(n_iterations):
-        available = [idx for idx in pool_indices if idx not in current_idx]
+        # Set membership keeps this O(pool) instead of O(pool x n); iteration order over
+        # pool_indices is unchanged, so the seeded RNG picks the same swaps as before.
+        current_set = set(current_idx)
+        available = [idx for idx in pool_indices if idx not in current_set]
         if not available or not current_idx:
             break
         remove_idx = current_idx[rng.integers(0, len(current_idx))]
@@ -2421,12 +2520,7 @@ with st.sidebar:
         )
         market = "KPI Pattern"
         if kpi_pattern_file is not None:
-            try:
-                _kp_peek = pd.read_excel(kpi_pattern_file, engine="calamine", header=0)
-            except Exception:
-                kpi_pattern_file.seek(0)
-                _kp_peek = pd.read_excel(kpi_pattern_file, engine="openpyxl", header=0)
-            kpi_pattern_file.seek(0)
+            _kp_peek = read_kpi_pattern_excel(kpi_pattern_file.getvalue())
             _kp_date_cols = detect_date_columns(_kp_peek)
             _kp_non_date_cols = [c for c in _kp_peek.columns if c not in _kp_date_cols]
             if len(_kp_non_date_cols) < 3 or not _kp_date_cols:
@@ -2534,12 +2628,7 @@ else:
         st.info("📂 Upload an aggregated KPI file and complete the selections in the sidebar to continue.")
         st.stop()
 
-    kpi_pattern_file.seek(0)
-    try:
-        _kp_full = pd.read_excel(kpi_pattern_file, engine="calamine", header=0)
-    except Exception:
-        kpi_pattern_file.seek(0)
-        _kp_full = pd.read_excel(kpi_pattern_file, engine="openpyxl", header=0)
+    _kp_full = read_kpi_pattern_excel(kpi_pattern_file.getvalue())
     _kp_metric_col_full = st.session_state["kpi_pattern_metric_col"]
     _kp_date_cols_full = detect_date_columns(_kp_full)
     _kp_dates_in_range = [d for d in sorted(_kp_date_cols_full) if kpi_pattern_date_range[0] <= d <= kpi_pattern_date_range[1]]
@@ -3113,6 +3202,9 @@ def render_structural_matching_tab():
             st.session_state.eligible_stds = dict(zip(active_features, eligible_stds_tuple))
 
             w_vec, p_scaled, t_cent = preprocess_data(pool_df, test_df_run, active_features, weights, eligible_means_tuple, eligible_stds_tuple)
+            # One vectorised scorer for the whole run — the strategy loops below score
+            # hundreds to thousands of candidate groups against the same fixed pool.
+            fast_metrics = make_fast_metrics_fn(pool_df, test_df_run, active_features, weights, eligible_means, eligible_stds)
             opt_data = []
             best_score = float("inf")
             best_idx = None
@@ -3128,7 +3220,7 @@ def render_structural_matching_tab():
                     nn = NearestNeighbors(n_neighbors=min(n, len(pool_df))).fit(p_scaled)
                     _, ind = nn.kneighbors(t_cent)
                     c_idx = [pool_df.index[j] for j in ind[0][:n]]
-                    metrics = calculate_metrics(test_df_run, agg_df.loc[c_idx], active_features, weights, eligible_means, eligible_stds)
+                    metrics = fast_metrics(c_idx)
                     mean_abs_smd = metrics["mean_abs_smd"]
                     # Use weighted structural distance as the optimisation objective so slider weights affect control selection.
                     # Mean Abs SMD is retained as an unweighted diagnostic balance metric.
@@ -3147,7 +3239,7 @@ def render_structural_matching_tab():
                     _, ind_w = nn_w.kneighbors(t_cent)
                     curr_idx = [pool_df.index[j] for j in ind_w[0][:n]]
                     pot_swaps = [pool_df.index[j] for j in ind_w[0] if pool_df.index[j] not in curr_idx][:CONFIG["max_hill_climbing_swaps"]]
-                    curr_metrics = calculate_metrics(test_df_run, agg_df.loc[curr_idx], active_features, weights, eligible_means, eligible_stds)
+                    curr_metrics = fast_metrics(curr_idx)
                     curr_score = curr_metrics["weighted_structural_distance"]
                     curr_mean_abs_smd = curr_metrics["mean_abs_smd"]
                     conv = [curr_score]
@@ -3160,7 +3252,7 @@ def render_structural_matching_tab():
                             for swap_in in pot_swaps[:10]:
                                 temp = curr_idx.copy()
                                 temp[j] = swap_in
-                                new_metrics = calculate_metrics(test_df_run, agg_df.loc[temp], active_features, weights, eligible_means, eligible_stds)
+                                new_metrics = fast_metrics(temp)
                                 new_score = new_metrics["weighted_structural_distance"]
                                 # Accept/reject swaps based on Weighted Structural Distance, not Mean Abs SMD.
                                 improvement = curr_score - new_score
@@ -3196,6 +3288,7 @@ def render_structural_matching_tab():
                         nn_start_idx=nn_start_idx,
                         n_iterations=genetic_iterations,
                         random_state=42,
+                        fast_metrics_fn=fast_metrics,
                     )
                     optimisation_score = best_metrics_for_n["weighted_structural_distance"]
                     opt_data.append({
