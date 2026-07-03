@@ -55,16 +55,16 @@ CONFIG = {
     "missing_threshold": 20,          # % missing above which we warn
     "outlier_std_threshold": 5,
     "ess_min_threshold": 500,         # softer threshold for ESS (was 1000)
-    # ---- Method comparison / Counterfactual Reliability traffic-light bands ----
+    # ---- Method comparison / Counterfactual Confidence traffic-light bands ----
     # Single source of truth for the classify_* helper functions below. Durbin-Watson
     # bands are practical interpretation bands, not formal critical-value tests — see
     # classify_autocorrelation_risk().
     "reliability_thresholds": {
-        "durbin_watson_low_band": (1.7, 2.3),          # 🟢 Low
-        "durbin_watson_moderate_low_band": (1.3, 1.7),  # 🟡 Moderate (positive autocorrelation side)
-        "durbin_watson_moderate_high_band": (2.3, 2.7), # 🟡 Moderate (negative autocorrelation side)
-        "overfitting_gap_pp": {"low_max": 3, "moderate_max": 8},
-        "rolling_smape_pct": {"low_max": 20, "moderate_max": 30},
+        "durbin_watson_low_band": (1.5, 2.5),          # 🟢 Low autocorrelation risk
+        "durbin_watson_moderate_low_band": (1.2, 1.5),  # 🟡 Moderate (positive autocorrelation side)
+        "durbin_watson_moderate_high_band": (2.5, 2.8), # 🟡 Moderate (negative autocorrelation side)
+        "overfitting_gap_pp": {"low_max": 3, "moderate_max": 5},
+        "rolling_smape_pct": {"low_max": 10, "moderate_max": 15},
         "rolling_bias_pct": {"low_max": 5, "moderate_max": 10},
     },
 }
@@ -310,6 +310,11 @@ def classify_autocorrelation_risk(dw_stat):
     - 2.0 = little/no first-order autocorrelation
     - below 2.0 = positive autocorrelation
     - above 2.0 = negative autocorrelation
+
+    Practical diagnostic bands used here (not formal critical-value tests):
+    - 🟢 Low autocorrelation risk: 1.5 to 2.5
+    - 🟡 Moderate autocorrelation risk: 1.2 to <1.5, or >2.5 to 2.8
+    - 🔴 High autocorrelation risk: <1.2 or >2.8
     """
     if not _is_valid_number(dw_stat):
         return "⚪ Insufficient data"
@@ -396,8 +401,9 @@ def classify_rolling_bias_risk(rolling_bias_pct):
 
 def combine_reliability_ratings(component_ratings):
     """
-    Derives the overall "Counterfactual Reliability" rating (Strong / Caution / Weak /
-    Insufficient data) from a dict of component traffic-light ratings, e.g.:
+    Derives the overall "Counterfactual Confidence" rating (🟢 High confidence /
+    🟡 Moderate confidence / 🔴 Low confidence / ⚪ Insufficient data) from a dict of
+    component traffic-light ratings, e.g.:
         {
             "rolling validation error": "🟢 Low",
             "overfitting gap": "🟡 Moderate",
@@ -406,50 +412,59 @@ def combine_reliability_ratings(component_ratings):
         }
 
     Rule: take the WORST available component.
-    - Any component 🔴  -> "Weak"
-    - Else any component 🟡  -> "Caution"
+    - Any component 🔴  -> "🔴 Low confidence"
+    - Else any component 🟡  -> "🟡 Moderate confidence"
     - Else, if at least one component is available (not ⚪) and all available
-      components are 🟢  -> "Strong"
-    - Otherwise (no components available at all) -> "Insufficient data"
+      components are 🟢  -> "🟢 High confidence"
+    - Otherwise (no components available at all) -> "⚪ Insufficient data"
 
-    This is deliberately simple and explainable: Counterfactual Reliability is nothing
+    This is deliberately simple and explainable: Counterfactual Confidence is nothing
     more than the worst result among rolling validation error, overfitting gap, rolling
     bias, and autocorrelation risk — there is no hidden downgrade logic.
+
+    (Internal variable/function names still use "reliability" for backward
+    compatibility; all user-facing labels use "Counterfactual Confidence".)
     """
     symbols = [v.split(" ", 1)[0] for v in component_ratings.values() if v]
     if any(s == "🔴" for s in symbols):
-        return "❌ Weak"
+        return "🔴 Low confidence"
     if any(s == "🟡" for s in symbols):
-        return "⚠️ Caution"
+        return "🟡 Moderate confidence"
     available = [s for s in symbols if s != "⚪"]
     if available and all(s == "🟢" for s in available):
-        return "✅ Strong"
-    return "Insufficient data"
+        return "🟢 High confidence"
+    return "⚪ Insufficient data"
 
 def get_reliability_drivers(component_ratings):
     """
     Produces a short, human-readable explanation of what drove the Counterfactual
-    Reliability rating, e.g. "🟡 Caution: moderate overfitting gap" or
-    "🔴 Weak: high rolling validation error + high autocorrelation risk".
+    Confidence rating, e.g. "Moderate overfitting gap" or
+    "High autocorrelation risk + moderate rolling bias".
 
     component_ratings: dict of {short driver label: traffic-light string}, using the
     same short driver labels as combine_reliability_ratings() (e.g. "rolling
     validation error", "overfitting gap", "rolling bias", "autocorrelation risk").
+
+    Unlike an earlier version of this function, the returned text lists ALL relevant
+    issues rather than only the issues at the single worst severity level — e.g. if
+    confidence is low because of a high-risk component, any moderate-risk components
+    are also included, not just the high-risk one(s).
     """
     overall = combine_reliability_ratings(component_ratings)
     symbols = {k: v.split(" ", 1)[0] for k, v in component_ratings.items() if v}
 
-    if overall == "Weak":
-        drivers = [k for k, s in symbols.items() if s == "🔴"]
-        detail = " + ".join(f"high {k}" for k in drivers) if drivers else "validation checks failed"
-        return f"{detail[:1].upper()}{detail[1:].lower()}"
-    if overall == "Caution":
-        drivers = [k for k, s in symbols.items() if s == "🟡"]
-        detail = " + ".join(f"moderate {k}" for k in drivers) if drivers else "elevated validation risk"
-        return f"{detail[:1].upper()}{detail[1:].lower()}"
-    if overall == "Strong":
+    if overall == "🔴 Low confidence":
+        drivers = [f"high {k}" for k, s in symbols.items() if s == "🔴"]
+        drivers += [f"moderate {k}" for k, s in symbols.items() if s == "🟡"]
+        detail = " + ".join(drivers) if drivers else "validation checks failed"
+        return f"{detail[:1].upper()}{detail[1:]}"
+    if overall == "🟡 Moderate confidence":
+        drivers = [f"moderate {k}" for k, s in symbols.items() if s == "🟡"]
+        detail = " + ".join(drivers) if drivers else "elevated validation risk"
+        return f"{detail[:1].upper()}{detail[1:]}"
+    if overall == "🟢 High confidence":
         return "Validation checks passed"
-    return "⚪ Insufficient data: rolling validation unavailable"
+    return "Insufficient validation data to assess confidence"
 
 # ------------------------------------------------------------
 # Frequency-awareness helpers (weekly vs daily time series)
@@ -794,14 +809,14 @@ def build_regularized_model(method_name, n_periods, n_splits_pref=5, fixed_alpha
         return model, "TimeSeriesSplit cross-validation used to select regularisation strength.", True
     # Too few pre-period observations for safe, leakage-free time-series CV. This
     # fixed-alpha fit is exploratory only: it is NOT statistically equivalent to
-    # cross-validated model selection and must not feed Counterfactual Reliability
+    # cross-validated model selection and must not feed Counterfactual Confidence
     # or rolling-origin validation metrics used for method comparison.
     l1_ratio = 1.0 if method_name == "lasso" else 0.5
     model = ElasticNet(alpha=fixed_alpha, l1_ratio=l1_ratio, max_iter=10000, random_state=42)
     cv_status = (
         f"Insufficient history for TimeSeriesSplit; exploratory fixed-alpha ElasticNet "
         f"fit (alpha={fixed_alpha}, l1_ratio={l1_ratio}) used instead — NOT cross-validated "
-        f"and excluded from Counterfactual Reliability."
+        f"and excluded from Counterfactual Confidence."
     )
     return model, cv_status, False
 
@@ -921,7 +936,7 @@ def rolling_origin_validation(X, y, horizon=4, min_training_periods=13, dates=No
 
     # Exploratory fixed-alpha folds are NOT statistically equivalent to cross-validated
     # results and must not feed the headline rolling-origin metrics used for method
-    # comparison or Counterfactual Reliability. Only TimeSeriesSplit-CV folds count here.
+    # comparison or Counterfactual Confidence. Only TimeSeriesSplit-CV folds count here.
     cv_fold_df = fold_df[~fold_df["used_cv_fallback"]]
     if n_cv_folds > 0:
         rolling_smape_mean = float(cv_fold_df["smape"].mean())
@@ -1002,16 +1017,16 @@ def _warn_on_row_loss(matrix_diagnostics):
 def _warn_on_cv_fallback(method_name, main_model_used_cv_fallback, fold_df):
     """
     Surfaces a warning whenever TimeSeriesSplit cross-validation couldn't be used —
-    either for the main pre-period model (no reliability rating at all) or for some
+    either for the main pre-period model (no confidence rating at all) or for some
     rolling-origin folds (those folds are excluded from the headline validation metrics
-    and Counterfactual Reliability). See build_regularized_model() and
+    and Counterfactual Confidence). See build_regularized_model() and
     rolling_origin_validation() for why this app never falls back to regular KFold.
     """
     if main_model_used_cv_fallback:
         st.warning(
             f"⚠️ There is insufficient pre-period history to run leakage-free TimeSeriesSplit "
             f"cross-validation for **{method_name}**. This method has not been given a "
-            "reliability rating. Add more pre-period data or reduce the validation window."
+            "confidence rating. Add more pre-period data or reduce the validation window."
         )
     elif not fold_df.empty and bool(fold_df["used_cv_fallback"].any()):
         n_fallback_folds = int(fold_df["used_cv_fallback"].sum())
@@ -1019,14 +1034,14 @@ def _warn_on_cv_fallback(method_name, main_model_used_cv_fallback, fold_df):
             f"⚠️ {n_fallback_folds} of {len(fold_df)} rolling-origin folds for **{method_name}** "
             "did not have enough training history for leakage-free TimeSeriesSplit cross-validation. "
             "Those folds were fit exploratorily with a fixed regularisation strength and are excluded "
-            "from the rolling-origin validation metrics and Counterfactual Reliability shown here."
+            "from the rolling-origin validation metrics and Counterfactual Confidence shown here."
         )
 
 def _summarize_rolling_origin_folds(fold_df):
     """
     Additional rolling-origin summary stats (P90 sMAPE, mean bias, uplift-error interval)
     computed only from TimeSeriesSplit-CV folds — exploratory fixed-alpha fallback folds
-    are excluded, since Rolling-Origin Bias (%) directly feeds Counterfactual Reliability
+    are excluded, since Rolling-Origin Bias (%) directly feeds Counterfactual Confidence
     and should not be contaminated by a non-cross-validated fit.
 
     Returns a dict with keys: rolling_smape_p90, rolling_bias_pct_mean,
@@ -1276,13 +1291,13 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     # If there isn't enough pre-period history for TimeSeriesSplit at all, rolling-origin
     # folds are all exploratory fixed-alpha fits too (a fold's training window can never be
     # longer than the full pre-period), so rolling_smape_mean/rolling_rmse_mean above are
-    # already np.nan in that case, and Counterfactual Reliability naturally reports
+    # already np.nan in that case, and Counterfactual Confidence naturally reports
     # "Insufficient data" rather than a misleading rating based on an arbitrary alpha.
     cv_status = f"Main model: {main_model_cv_status} Rolling-origin folds: {rolling_cv_status}"
     _warn_on_cv_fallback(method_name, main_model_used_cv_fallback, fold_df)
 
     # Additional rolling-origin summary stats. These also exclude exploratory fixed-alpha
-    # folds, since Rolling-Origin Bias (%) directly feeds Counterfactual Reliability and
+    # folds, since Rolling-Origin Bias (%) directly feeds Counterfactual Confidence and
     # should not be contaminated by a non-cross-validated fit.
     _rolling_summary = _summarize_rolling_origin_folds(fold_df)
     rolling_smape_p90 = _rolling_summary["rolling_smape_p90"]
@@ -1448,7 +1463,7 @@ def run_validation_method(agg_df, control_list, test_regions, method_name,
     autocorrelation_risk = classify_autocorrelation_risk(dw_stat)
     validation_method_label = classify_validation_method(fold_df, main_model_used_cv_fallback)
 
-    # ---- Counterfactual Reliability: the worst of the four component ratings above,
+    # ---- Counterfactual Confidence: the worst of the four component ratings above,
     # with a short explanation of which one(s) drove it. No hidden downgrade logic. ----
     reliability_components = {
         "rolling validation error": rolling_validation_error_risk,
@@ -3126,11 +3141,14 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
     # ---- Method Comparison table ----
     st.subheader("Method Comparison")
 
+    # combine_reliability_ratings() already returns the full user-facing label
+    # (e.g. "🟢 High confidence"), so this is a passthrough map with a safe fallback
+    # for any unexpected/legacy value.
     RELIABILITY_LABELS = {
-        "Strong": "🟢 Strong",
-        "Caution": "🟡 Caution",
-        "Weak": "🔴 Weak",
-        "Insufficient data": "⚪ Insufficient data",
+        "🟢 High confidence": "🟢 High confidence",
+        "🟡 Moderate confidence": "🟡 Moderate confidence",
+        "🔴 Low confidence": "🔴 Low confidence",
+        "⚪ Insufficient data": "⚪ Insufficient data",
     }
 
     comparison_rows = [
@@ -3166,8 +3184,8 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         {"Metric": "Median Placebo Uplift", "key": "median_placebo_uplift_pct"},
         {"Metric": "95% Placebo Uplift Range", "key": "placebo_range_pct"},
 
-        {"Metric": "G. OVERALL COUNTERFACTUAL ASSESSMENT", "is_section": True},
-        {"Metric": "Counterfactual Confidence", "key": "counterfactual_reliability"},
+        {"Metric": "G. COUNTERFACTUAL CONFIDENCE", "is_section": True},
+        {"Metric": "Overall Counterfactual Confidence", "key": "counterfactual_reliability"},
         {"Metric": "Key Issues", "key": "reliability_drivers"},
 
     ]
@@ -3247,10 +3265,10 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         elif key == "overfitting_risk":
             return res.get("overfitting_risk", "⚪ Insufficient data")
         elif key == "reliability_drivers":
-            return res.get("reliability_drivers", "⚪ Insufficient data: rolling validation unavailable")
+            return res.get("reliability_drivers", "Insufficient validation data to assess confidence")
         elif key == "counterfactual_reliability":
             reliability = res.get("counterfactual_reliability", None)
-            return RELIABILITY_LABELS.get(reliability, "N/A")
+            return RELIABILITY_LABELS.get(reliability, "⚪ Insufficient data")
         elif key == "placebo_windows":
             return str(len(res['placebos']))
         elif key == "median_placebo_uplift_pct":
@@ -3330,12 +3348,13 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
         "this range, it may not be distinguishable from normal historical noise."
     )
     st.caption(
-        "**Counterfactual Reliability** is the overall traffic-light summary. It takes the worst result "
-        "from the main validation checks: rolling validation error, overfitting gap, rolling bias, and "
-        "residual autocorrelation."
+        "**Overall Counterfactual Confidence** is the overall traffic-light summary. It takes the worst "
+        "result from the main validation checks: rolling validation error, overfitting gap, residual "
+        "autocorrelation, and rolling bias."
     )
     st.caption(
-        "**Reliability Drivers** explains which check(s) drove the rating. "
+        "**Key Issues** lists all the high- and moderate-risk checks that drove the confidence rating, "
+        "not just the single worst one. "
         "Traffic-light bands are interpretation aids based on validation diagnostics — they are not "
         "standalone hypothesis tests."
     )
@@ -3348,40 +3367,56 @@ def render_method_comparison_table(results, mode, test_start, control_regions_va
 
 The goal here is to assess whether your control group can reliably predict what would have happened to your test regions without any intervention. If it can, you can have more confidence in a future uplift estimate.
 
+We recommend interpreting the checks in this order: rolling-origin validation error, then overfitting, then residual diagnostics, then rolling bias, then Overall Counterfactual Confidence as the final summary.
+
 ---
 
-**Step 1 — Start with Rolling-Origin Validation**
+**Step 1 — Start with Rolling-Origin Validation Error**
 
-This checks whether the model can predict held-out historical periods using only earlier data. It is the main evidence that the counterfactual model generalises, and is far more trustworthy than pre-period fit alone.
+This is the main check for whether the model can predict unseen historical data, and should be treated as the primary model-quality check. It is far more trustworthy than pre-period fit alone.
 
-- **Rolling-Origin sMAPE (%)** — Typical percentage error when predicting the test KPI from controls. Aim for below 10%. Above 20% suggests the control group is a poor predictor.
+- **Rolling-Origin sMAPE (%)** — Typical percentage error when predicting the test KPI from controls. Lower validation sMAPE means the counterfactual is likely to be more trustworthy. 🟢 Low: 10% or below. 🟡 Moderate: above 10% up to 15%. 🔴 High: above 15%.
 - **Rolling-Origin sMAPE — Worst Case (P90)** — The error in the weakest 10% of forecast windows. Even if the average looks fine, a high P90 means the model breaks down in certain periods.
-- **Rolling-Origin Bias (%)** — Whether the model consistently overshoots or undershoots. Anything beyond ±5% is a warning sign: the counterfactual will be structurally biased even if sMAPE looks acceptable.
 
 ---
 
-**Step 2 — Check Overfitting / Reliability Checks**
+**Step 2 — Then check Overfitting**
 
-A method can look excellent in-sample and still be unreliable if it's fitting coincidental historical patterns rather than a genuine relationship.
+Compare pre-period fit against rolling-origin validation. A large gap means the model may look good in-sample but perform poorly on unseen data.
 
-- **Overfitting Gap, sMAPE percentage points** — Compares the model's in-sample pre-period error with its held-out rolling validation error. A large positive gap (roughly above 3–8 percentage points) means the model looks good on the data it was fitted on, but performs worse when predicting unseen historical periods. This is a validation diagnostic, not a formal statistical test.
-- **Overfitting Risk** — A short traffic-light rating based only on the Overfitting Gap: does the model look meaningfully worse on held-out historical validation than on the fitted pre-period?
-- **Durbin-Watson** / **Autocorrelation Risk** — Durbin-Watson is an established statistic for first-order residual autocorrelation. Values near 2 suggest little autocorrelation; values materially below or above 2 suggest the model is missing time patterns. The traffic-light label is an interpretation band, not a formal critical-value test.
-- **Counterfactual Reliability** — The overall traffic-light summary. It takes the worst result from the main validation checks: Rolling Validation Error, Overfitting Risk, Rolling Bias Risk, and Autocorrelation Risk. **Reliability Drivers** explains which check(s) drove the rating. If it shows "Insufficient data", rolling-origin validation didn't produce enough usable folds to assess this — this is a data-availability gap, not evidence that reliability is strong.
+- **Overfitting Gap, sMAPE percentage points** — Rolling-origin validation sMAPE minus pre-period sMAPE. 🟢 Low: up to 3 percentage points. 🟡 Moderate: above 3 up to 5 percentage points. 🔴 High: above 5 percentage points. This is a validation diagnostic, not a formal statistical test.
 
-**How to read the reliability checks**
+---
 
-1. **Rolling Validation Error** checks whether the model predicts held-out historical periods accurately.
-2. **Overfitting Risk** checks whether the model performs much worse on held-out periods than it does on the fitted pre-period.
-3. **Rolling Bias Risk** checks whether the model systematically over- or under-predicts.
-4. **Autocorrelation Risk** checks whether residuals still contain time patterns.
-5. **Counterfactual Reliability** takes the worst of these checks as the overall rating.
+**Step 3 — Then check Residual Diagnostics**
+
+Use Durbin-Watson / autocorrelation risk to assess whether residuals are independent enough. Strong autocorrelation means the model may be missing time structure.
+
+- **Durbin-Watson** / **Autocorrelation Risk** — Durbin-Watson is an established statistic for first-order residual autocorrelation. Values near 2 suggest little autocorrelation. 🟢 Low autocorrelation risk: 1.5 to 2.5. 🟡 Moderate autocorrelation risk: 1.2 to just under 1.5, or above 2.5 up to 2.8. 🔴 High autocorrelation risk: below 1.2 or above 2.8. These are practical diagnostic bands, not formal critical-value tests.
+
+---
+
+**Step 4 — Then check Rolling Bias**
+
+Bias tells you whether the model systematically over- or under-predicts in validation windows. Rolling bias feeds into Overall Counterfactual Confidence — if bias is moderate or high, be more cautious about interpreting the uplift.
+
+- **Rolling-Origin Bias (%)** — Whether the model consistently overshoots or undershoots. 🟢 Low: absolute bias 5% or below. 🟡 Moderate: above 5% up to 10%. 🔴 High: above 10%.
+
+---
+
+**Step 5 — Use Overall Counterfactual Confidence as the final summary**
+
+- **Overall Counterfactual Confidence** — The overall traffic-light summary. It takes the worst result from the checks above: Rolling Validation Error, Overfitting Risk, Autocorrelation Risk, and Rolling Bias Risk. **Key Issues** lists every high- and moderate-risk check that contributed, not just the single worst one.
+    - 🟢 **High confidence** — Suitable to proceed, assuming the business context also makes sense.
+    - 🟡 **Moderate confidence** — Usable, but interpret uplift cautiously and check the Key Issues.
+    - 🔴 **Low confidence** — Don't rely on the counterfactual without improving the model, controls, or time window.
+    - ⚪ **Insufficient data** — Not enough validation evidence to make a reliable judgement. This is a data-availability gap, not evidence that confidence is high.
 
 Traffic-light bands are interpretation aids based on validation diagnostics. They are not standalone hypothesis tests.
 
 ---
 
-**Step 3 — Review Placebo Testing**
+**Step 6 — Review Placebo Testing**
 
 Placebo tests simulate running a fake intervention across all available historical windows. A well-behaved model produces placebo uplifts clustered near zero.
 
@@ -3390,15 +3425,13 @@ Placebo tests simulate running a fake intervention across all available historic
 
 ---
 
-**Step 4 — Use Pre-Period Fit as a sanity check only**
+**Step 7 — Use Pre-Period Fit as a sanity check only**
 
 Pre-period Correlation is shown for reference but can be misleadingly high — a model can fit the pre-period well and still fail out-of-sample. Always weight the rolling-origin metrics more heavily.
 
-**Durbin-Watson** is an established statistic for first-order residual autocorrelation in the model's pre-period residuals. It is around 2.0 when residuals have little autocorrelation; values below 2 suggest positive autocorrelation, values above 2 suggest negative autocorrelation. Strong autocorrelation is a sign the model is missing structure in the data (e.g. trends or delayed effects) that the standard errors don't account for.
-
 ---
 
-**Rule of thumb:** Low rolling-origin sMAPE + Strong/Caution Counterfactual Reliability + a narrow, tight placebo distribution = a reliable test design ready to run.
+**Rule of thumb:** Low rolling-origin sMAPE + High/Moderate Overall Counterfactual Confidence + a narrow, tight placebo distribution = a reliable test design ready to run.
             """)
         else:
             st.markdown("""
@@ -3406,43 +3439,69 @@ Pre-period Correlation is shown for reference but can be misleadingly high — a
 
 Before trusting the uplift estimate, verify the model can reliably predict the test KPI. An unreliable model produces an unreliable uplift number.
 
+We recommend interpreting the checks in this order: rolling-origin validation error, then overfitting, then residual diagnostics, then rolling bias, then Overall Counterfactual Confidence as the final summary.
+
 ---
 
-**Step 1 — Verify the model is trustworthy**
+**Step 1 — Start with Rolling-Origin Validation Error**
 
-Start with Rolling-Origin Validation. This checks whether the model can predict held-out historical periods using only earlier data. It is the main evidence that the counterfactual model generalises.
+This is the main check for whether the model can predict unseen historical data, and should be treated as the primary model-quality check.
 
-- **Rolling-Origin sMAPE (%)** — Typical out-of-sample prediction error. If this is above 15–20%, treat the uplift estimate with caution — the counterfactual baseline is uncertain.
-- **Rolling-Origin Bias (%)** — Persistent bias in the model's predictions. A model that consistently undershoots will overstate uplift, and vice versa.
-- **Counterfactual Reliability** — The overall traffic-light summary. It takes the worst result from the main validation checks: Rolling Validation Error, Overfitting Risk, Rolling Bias Risk, and Autocorrelation Risk. **Reliability Drivers** explains which check(s) drove the rating. If this is "Weak", treat the uplift number with extra caution, particularly for data-optimised methods. If it shows "Insufficient data", there wasn't enough rolling-origin history to assess this at all — treat the uplift with the same caution you would give a "Weak" result. The traffic-light label is an interpretation aid, not a formal statistical test.
+- **Rolling-Origin sMAPE (%)** — Typical out-of-sample prediction error. Lower validation sMAPE means the counterfactual is likely to be more trustworthy. 🟢 Low: 10% or below. 🟡 Moderate: above 10% up to 15%. 🔴 High: above 15% — treat the uplift estimate with caution, since the counterfactual baseline is uncertain.
+
+---
+
+**Step 2 — Then check Overfitting**
+
+Compare pre-period fit against rolling-origin validation. A large gap means the model may look good in-sample but perform poorly on unseen data.
+
+- **Overfitting Gap, sMAPE percentage points** — Rolling-origin validation sMAPE minus pre-period sMAPE. 🟢 Low: up to 3 percentage points. 🟡 Moderate: above 3 up to 5 percentage points. 🔴 High: above 5 percentage points.
+
+---
+
+**Step 3 — Then check Residual Diagnostics**
+
+Use Durbin-Watson / autocorrelation risk to assess whether residuals are independent enough. Strong autocorrelation means the model may be missing time structure.
+
+- **Durbin-Watson** / **Autocorrelation Risk** — 🟢 Low autocorrelation risk: 1.5 to 2.5. 🟡 Moderate autocorrelation risk: 1.2 to just under 1.5, or above 2.5 up to 2.8. 🔴 High autocorrelation risk: below 1.2 or above 2.8. These are practical diagnostic bands, not formal critical-value tests.
+
+---
+
+**Step 4 — Then check Rolling Bias**
+
+Bias tells you whether the model systematically over- or under-predicts in validation windows. A model that consistently undershoots will overstate uplift, and vice versa. If bias is moderate or high, be more cautious about interpreting the uplift.
+
+- **Rolling-Origin Bias (%)** — 🟢 Low: absolute bias 5% or below. 🟡 Moderate: above 5% up to 10%. 🔴 High: above 10%.
+
+---
+
+**Step 5 — Use Overall Counterfactual Confidence as the final summary**
+
+- **Overall Counterfactual Confidence** — The overall traffic-light summary. It takes the worst result from the checks above: Rolling Validation Error, Overfitting Risk, Autocorrelation Risk, and Rolling Bias Risk. **Key Issues** lists every high- and moderate-risk check that contributed, not just the single worst one.
+    - 🟢 **High confidence** — Suitable to proceed, assuming the business context also makes sense.
+    - 🟡 **Moderate confidence** — Usable, but interpret uplift cautiously and check the Key Issues, particularly for data-optimised methods.
+    - 🔴 **Low confidence** — Don't rely on the counterfactual without improving the model, controls, or time window.
+    - ⚪ **Insufficient data** — Not enough rolling-origin history to assess this at all; treat the uplift with the same caution you would give a low-confidence result.
 - **95% Placebo Uplift Range** — The range of apparent uplifts the model detects in historical periods with no intervention. Your observed uplift needs to sit clearly outside this range.
-
-**How to read the reliability checks**
-
-1. **Rolling Validation Error** checks whether the model predicts held-out historical periods accurately.
-2. **Overfitting Risk** checks whether the model performs much worse on held-out periods than it does on the fitted pre-period.
-3. **Rolling Bias Risk** checks whether the model systematically over- or under-predicts.
-4. **Autocorrelation Risk** checks whether residuals still contain time patterns.
-5. **Counterfactual Reliability** takes the worst of these checks as the overall rating.
 
 Traffic-light bands are interpretation aids based on validation diagnostics. They are not standalone hypothesis tests.
 
 ---
 
-**Step 2 — Assess the uplift result**
+**Step 6 — Assess the uplift result**
 
 - **Observed Uplift Percentile vs Placebos** — Where your observed uplift ranks relative to the distribution of historical placebo (fake-test) uplifts. 95th percentile or above is stronger evidence that the observed uplift is unusual relative to pre-period noise.
 - **Observed Uplift p-value** — The placebo p-value is an empirical extremeness check: it shows how unusual the observed uplift is relative to historical fake-test windows. It is not proof of causality and should be interpreted alongside model fit, rolling-origin validation, and business context. Below 0.05 is the conventional (approximate) threshold analysts use as a rule of thumb.
 
 ---
 
-**Step 3 — Compare methods**
+**Step 7 — Compare methods**
 
-If you ran multiple methods (Structural, Data-Optimised), look for agreement. When both methods produce similar uplift estimates, both show good out-of-sample fit, and both show Strong/Caution Counterfactual Reliability, confidence in the result is higher.
+If you ran multiple methods (Structural, Data-Optimised), look for agreement. When both methods produce similar uplift estimates, both show good out-of-sample fit, and both show High/Moderate Overall Counterfactual Confidence, confidence in the result is higher.
 
 ---
 
-**Rule of thumb:** Low rolling-origin sMAPE + Strong/Caution Counterfactual Reliability + observed uplift outside the placebo range + a small p-value = a result with stronger evidence behind it, though still not proof of causality on its own.
+**Rule of thumb:** Low rolling-origin sMAPE + High/Moderate Overall Counterfactual Confidence + observed uplift outside the placebo range + a small p-value = a result with stronger evidence behind it, though still not proof of causality on its own.
             """)
 
 
