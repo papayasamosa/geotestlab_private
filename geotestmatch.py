@@ -5426,7 +5426,9 @@ def render_time_series_validation(mode: str):
                 "given size to each, and count how often the design would have flagged it as a real effect. The "
                 "\"minimum detectable effect\" (MDE) is the smallest effect the design catches at least 80% of the "
                 "time. Rule of thumb: only run the test if the effect you're realistically hoping for is at least "
-                "this big — otherwise a real effect will likely be lost in the noise."
+                "this big — otherwise a real effect will likely be lost in the noise. "
+                "*(For technical readers: an empirical power analysis at one-sided \u03b1 = 5%; methodology in the "
+                "expander below.)*"
             )
             _power_alpha = 0.05
             _power_target = 0.80
@@ -5452,33 +5454,66 @@ def render_time_series_validation(mode: str):
                     "Add more pre-period history or shorten the placebo window length, then re-run validation."
                 )
             else:
-                st.dataframe(pd.DataFrame(_mde_rows), width='stretch', hide_index=True)
+                st.dataframe(
+                    pd.DataFrame(_mde_rows),
+                    width='stretch',
+                    hide_index=True,
+                    column_config={
+                        "Placebo Windows": st.column_config.NumberColumn(
+                            "Placebo Windows",
+                            help=(
+                                "Number of fake-test windows used. This is also the resolution limit: "
+                                "power estimates move in steps of 1 \u00f7 this number."
+                            ),
+                        ),
+                        "Smallest detectable uplift": st.column_config.TextColumn(
+                            "Smallest detectable uplift",
+                            help=(
+                                "Minimum detectable effect (MDE) at 80% power. Detection = measured uplift-% "
+                                "above the 95th percentile of the placebo uplift-% distribution "
+                                "(one-sided \u03b1 = 5%)."
+                            ),
+                        ),
+                        "Smallest detectable decline": st.column_config.TextColumn(
+                            "Smallest detectable decline",
+                            help=(
+                                "Minimum detectable effect (MDE) at 80% power. Detection = measured uplift-% "
+                                "below the 5th percentile of the placebo uplift-% distribution "
+                                "(one-sided \u03b1 = 5%)."
+                            ),
+                        ),
+                    },
+                )
                 _power_dir = st.radio(
                     "Effect direction",
                     ["Uplift (campaign / launch)", "Decline (media pause)"],
                     horizontal=True,
                     key=f"{mode_prefix}_power_direction",
+                    help=(
+                        "Which direction of effect to chart. Technical: uplifts are tested one-sided against the "
+                        "95th percentile of the placebo uplift-% distribution; declines against the 5th percentile."
+                    ),
                 )
                 _dir_col = "power_lift" if _power_dir.startswith("Uplift") else "power_drop"
                 _chart_frames = []
                 for _m_name, _curve in _power_curves.items():
                     _chart_frames.append(pd.DataFrame({
                         "True effect size (%)": _curve["effect_pct"],
-                        "Chance of detecting it": _curve[_dir_col],
+                        "Chance of detecting it (power)": _curve[_dir_col],
                         "Method": _m_name,
                     }))
                 _power_chart_df = pd.concat(_chart_frames, ignore_index=True)
                 _fig_power = px.line(
                     _power_chart_df,
                     x="True effect size (%)",
-                    y="Chance of detecting it",
+                    y="Chance of detecting it (power)",
                     color="Method",
                     range_y=[0, 1.02],
                 )
                 _fig_power.layout.yaxis.tickformat = ".0%"
                 _fig_power.add_hline(
                     y=_power_target, line_dash="dash", line_color="grey",
-                    annotation_text=f"{int(_power_target * 100)}% — reliable detection",
+                    annotation_text=f"{int(_power_target * 100)}% power — reliable detection",
                     annotation_position="top left",
                 )
                 st.plotly_chart(_fig_power, width='stretch')
@@ -5493,12 +5528,15 @@ def render_time_series_validation(mode: str):
                     "⚠️ Treat these numbers as a planning guide, not a guarantee. They come from a limited number of "
                     "practice runs on your own history, and they assume the future will be about as noisy as the past."
                 )
-                with st.expander("How this is calculated (technical detail)", expanded=False):
+                with st.expander("How this is calculated (methodology)", expanded=False):
                     st.markdown(
-                        "- Each placebo window above is a \"fake test\" where nothing happened. A pretend effect of "
-                        "+x% is added to each window's actuals; because the model was trained on data *before* the "
-                        "window, the fit is unchanged and the measured uplift shifts in closed form — no refitting "
-                        "needed.\n"
+                        "- Each placebo window above is a \"fake test\" where nothing happened, measured with the "
+                        "same actual-vs-counterfactual machinery as a real result in Evaluate mode: uplift = actuals "
+                        "minus the model's counterfactual prediction, trained only on data *before* the window.\n"
+                        "- A pretend effect of +x% is added to each window's actuals; because the training data "
+                        "precedes the window, the model fit is unchanged and the measured uplift shifts in closed "
+                        "form — no refitting needed: measured uplift-% = placebo-% \u00d7 (1 + x/100) + x "
+                        "(mirror image for declines).\n"
                         "- \"Detected\" means the shifted uplift-% falls outside the no-effect placebo distribution "
                         "at a one-sided 5% level: beyond its 95th percentile for uplifts, below its 5th percentile "
                         "for declines.\n"
@@ -5632,7 +5670,7 @@ with tab4:
                     )
 
                     use_ar1_errors = st.checkbox(
-                        "Allow for noise streaks (recommended)",
+                        "Allow for noise streaks — AR(1) errors (recommended)",
                         value=True,
                         key="use_ar1_errors",
                         help=(
@@ -5644,8 +5682,12 @@ with tab4:
                             "keeping the headline result honest.\n\n"
                             "OFF: each period's noise is treated as independent (the previous behaviour). "
                             "If your data isn't streaky, both settings give almost the same answer.\n\n"
-                            "Technical note: this fits an AR(1) error model, with the streakiness parameter (\u03c1) "
-                            "estimated from the pre-period."
+                            "Technical note: residuals follow an AR(1) process — e(t) = \u03c1\u00b7e(t\u22121) + shock — with \u03c1 "
+                            "estimated from the pre-period via the exact conditional likelihood. \u03c3 then acts as the "
+                            "innovation SD (marginal residual SD = \u03c3 / sqrt(1 \u2212 \u03c1\u00b2)), and the predictive bands are "
+                            "simulated AR(1) residual paths anchored on the last pre-period residual. Positive "
+                            "autocorrelation (Durbin-Watson below ~2 in the validation tabs) is the signal that this "
+                            "setting matters."
                         ),
                     )
 
@@ -6246,7 +6288,9 @@ with tab4:
                 _ar1_caption = (
                     f" The model also measured how streaky the noise is (\u2248 {bayes['rho_mean']:.2f} on a scale "
                     "where 0 = no streaks and 1 = very streaky) and has factored this into the green band and the "
-                    "uplift range — streaky noise makes totals more uncertain, so the ranges widen accordingly."
+                    "uplift range — streaky noise makes totals more uncertain, so the ranges widen accordingly. "
+                    f"(Technical: AR(1) residual model; 94% interval for \u03c1: {bayes['rho_hdi_lower']:.2f} to "
+                    f"{bayes['rho_hdi_upper']:.2f}.)"
                 )
             st.caption(
                 "**Blue** (pre-period) = uncertainty in the average fitted relationship, no noise added. "
@@ -6490,7 +6534,7 @@ with tab4:
                 **Reading the chart**
                 - The blue band (pre-period) is the 94% HDI / credible interval around the *fitted counterfactual mean* — it does not include observation-level noise, so it is narrower.
                 - The green band (test/post-period) is the 94% posterior predictive interval — the plausible range of *actual counterfactual observations* under the no-test scenario, including observation-level noise. This is what you should compare the actuals against.
-                - When "Allow for noise streaks" is on (the default), the model checks whether noise runs in streaks — a high period followed by another high period. If it does, the green band and the uplift range are widened to match, because streaky noise doesn't cancel out over the test window the way independent noise would. (Technically: an AR(1) error model estimated from the pre-period.)
+                - When "Allow for noise streaks" is on (the default), the model checks whether noise runs in streaks — a high period followed by another high period. If it does, the green band and the uplift range are widened to match, because streaky noise doesn't cancel out over the test window the way independent noise would. (Technically: an AR(1) error model — e(t) = \u03c1\u00b7e(t\u22121) + noise — fitted via the exact conditional likelihood; the bands are simulated AR(1) residual paths anchored on the last pre-period residual, so multi-period totals inherit the autocorrelation.)
                 """)
 
 # ------------------------------------------------------------
