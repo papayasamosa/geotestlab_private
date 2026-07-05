@@ -1368,6 +1368,139 @@ def _summarize_placebo_results(placebos, placebo_uplift_pcts, placebo_smapes, pl
         "percentile_rank": percentile_rank, "p_one_sided": p_one_sided, "p_two_sided": p_two_sided, "z_score": z_score,
     }
 
+# ------------------------------------------------------------
+# AR(1) predictive-residual simulation (Bayesian TBR intervals)
+# ------------------------------------------------------------
+def ar1_gap_steps(last_date, next_date, frequency_config):
+    """Number of AR(1) steps between two dates for the given frequency (min 1).
+
+    Used to bridge any calendar gap between the pre-period and the test period
+    (or the test period and the post period) when carrying residual paths
+    forward: gap steps are simulated with noise and discarded, so a long gap
+    naturally decays the carried-over residual toward the stationary
+    distribution instead of pretending the periods are adjacent.
+    """
+    try:
+        delta_days = (pd.Timestamp(next_date) - pd.Timestamp(last_date)).days
+        period_days = 7 if (frequency_config or {}).get("frequency") == "weekly" else 1
+        return max(int(round(delta_days / period_days)), 1)
+    except Exception:
+        return 1
+
+
+def simulate_ar1_predictive_residuals(post_rho, post_sigma, n_periods, rng,
+                                      e_start=None, n_gap_steps=1):
+    """
+    Simulate AR(1) residual paths for posterior predictive counterfactuals.
+
+        e_t = rho * e_{t-1} + nu_t,   nu_t ~ Normal(0, sigma)
+
+    One path per posterior draw, vectorised across draws.
+
+    Why this exists: the app's headline number is the predictive interval on the
+    *total* uplift over the test window. Summing i.i.d. per-period noise assumes
+    errors cancel across periods; with positively autocorrelated residuals
+    (Durbin-Watson < 2) they partially reinforce instead, so the i.i.d. interval
+    is too narrow. Simulating the AR(1) recursion per draw gives the total its
+    honest width, and exactly reproduces the old i.i.d. behaviour when rho = 0.
+
+    Args:
+        post_rho / post_sigma: 1-D arrays of posterior draws (rho may be all
+            zeros, in which case this reduces to i.i.d. Normal(0, sigma) noise).
+            sigma is the *innovation* SD when rho != 0.
+        n_periods: number of forecast periods to return residuals for.
+        rng: a seeded np.random.Generator — the caller controls reproducibility.
+        e_start: optional 1-D array (one value per draw) of the residual
+            immediately before the forecast window (e.g. the last pre-period
+            residual, in scaled space). If None, paths start from the stationary
+            distribution Normal(0, sigma / sqrt(1 - rho^2)).
+        n_gap_steps: number of AR steps between e_start's period and the first
+            forecast period (1 = contiguous). See ar1_gap_steps().
+
+    Returns:
+        Array of shape (n_draws, n_periods) of residuals in the *scaled* space
+        the model was fit in.
+    """
+    rho = np.asarray(post_rho, dtype=float)
+    sigma = np.asarray(post_sigma, dtype=float)
+    n_draws = len(sigma)
+    if e_start is None:
+        denom = np.sqrt(np.clip(1.0 - rho ** 2, 1e-12, None))
+        prev = rng.normal(0.0, 1.0, size=n_draws) * (sigma / denom)
+        warmup = 0  # already stationary; no warm-up needed
+    else:
+        prev = np.asarray(e_start, dtype=float).copy()
+        warmup = max(int(n_gap_steps) - 1, 0)
+    for _ in range(warmup):
+        prev = rho * prev + rng.normal(0.0, 1.0, size=n_draws) * sigma
+    out = np.empty((n_draws, int(n_periods)))
+    for t in range(int(n_periods)):
+        prev = rho * prev + rng.normal(0.0, 1.0, size=n_draws) * sigma
+        out[:, t] = prev
+    return out
+
+
+# ------------------------------------------------------------
+# Power analysis / Minimum Detectable Effect (Design mode)
+# ------------------------------------------------------------
+def compute_power_curve(placebo_uplift_pcts, effect_grid_pct=None, alpha=0.05):
+    """
+    Empirical power curve for a geo-test design, derived from the placebo
+    (fake-test) uplift-% distribution — no model refitting required.
+
+    Logic: injecting a synthetic uplift of +x% into a placebo window multiplies
+    that window's fake-test actuals by (1 + x/100) while leaving the model fit
+    untouched (training data precedes the window), so the window's measured
+    uplift-% shifts in closed form:
+
+        lift:    measured_pct = placebo_pct * (1 + x/100) + x
+        decline: measured_pct = placebo_pct * (1 - x/100) - x
+
+    "Detected" means the shifted uplift-% crosses a one-sided empirical
+    threshold from the no-effect placebo distribution: its (1 - alpha) quantile
+    for lifts, its alpha quantile for declines. Power at effect size x is the
+    share of placebo windows that would have been detected.
+
+    Caveats (surfaced in the UI): the same finite placebo sample provides both
+    the null threshold and the power estimate; overlapping windows are
+    positively correlated; and the approach assumes future noise behaves like
+    pre-period noise. Resolution is limited to ~1 / n_windows.
+
+    Returns a DataFrame with columns [effect_pct, power_lift, power_drop];
+    empty if fewer than 5 valid placebo windows are available.
+    """
+    if placebo_uplift_pcts is None:
+        placebo_uplift_pcts = []
+    pcts = np.asarray(
+        [p for p in placebo_uplift_pcts if _is_valid_number(p)],
+        dtype=float,
+    )
+    if len(pcts) < 5:
+        return pd.DataFrame(columns=["effect_pct", "power_lift", "power_drop"])
+    if effect_grid_pct is None:
+        effect_grid_pct = np.round(np.arange(0.5, 30.0 + 1e-9, 0.5), 2)
+    thr_hi = np.percentile(pcts, (1.0 - alpha) * 100)
+    thr_lo = np.percentile(pcts, alpha * 100)
+    rows = []
+    for x in effect_grid_pct:
+        shifted_up = pcts * (1.0 + x / 100.0) + x
+        shifted_dn = pcts * (1.0 - x / 100.0) - x
+        rows.append({
+            "effect_pct": float(x),
+            "power_lift": float(np.mean(shifted_up > thr_hi)),
+            "power_drop": float(np.mean(shifted_dn < thr_lo)),
+        })
+    return pd.DataFrame(rows)
+
+
+def find_mde(power_df, column, target_power=0.8):
+    """Smallest effect size (%) whose empirical power meets target_power, or None."""
+    if power_df is None or power_df.empty or column not in power_df.columns:
+        return None
+    hit = power_df[power_df[column] >= target_power]
+    return float(hit["effect_pct"].iloc[0]) if not hit.empty else None
+
+
 def run_validation_method(agg_df, control_list, test_regions, method_name,
                           pre_start, pre_end, test_start=None, test_end=None,
                           use_post=False, post_start=None, post_end=None,
@@ -5274,6 +5407,91 @@ def render_time_series_validation(mode: str):
         # interpretation help — rendered by a standalone, independently testable function. ----
         render_method_comparison_table(results, mode, test_start, control_regions_val)
 
+        # ---- Power analysis / Minimum Detectable Effect (Design mode only) ----
+        # Reuses each method's placebo (fake-test) uplift distribution: injecting a
+        # synthetic +/- x% effect into a placebo window shifts its measured uplift-%
+        # in closed form (the model fit is unaffected, because training data precedes
+        # the window), so power at each effect size is computed with zero refitting.
+        # See compute_power_curve() for the math and caveats.
+        if mode == "Design":
+            st.subheader("Power Analysis — Minimum Detectable Effect (MDE)")
+            _first_res = next(iter(results.values()), {})
+            _p_len = _first_res.get("placebo_length_periods")
+            _p_unit = freq_config["period_label_plural"]
+            st.caption(
+                f"Estimated from the placebo (fake-test) windows above: what size of sustained effect, over a test of "
+                f"{_p_len if _p_len else 'the configured number of'} {_p_unit}, would this design actually detect? "
+                "\"Detect\" means the measured uplift-% falls outside the placebo noise distribution at a one-sided 5% "
+                "level (beyond its 95th percentile for uplifts; below its 5th percentile for declines). As a planning "
+                "rule: only run tests where the effect you realistically expect is at or above the 80%-power MDE."
+            )
+            _power_alpha = 0.05
+            _power_target = 0.80
+            _power_curves = {}
+            _mde_rows = []
+            for _m_name, _m_res in results.items():
+                _curve = compute_power_curve(_m_res.get("placebo_uplift_pcts"), alpha=_power_alpha)
+                if _curve.empty:
+                    continue
+                _power_curves[_m_name] = _curve
+                _n_windows = len([p for p in (_m_res.get("placebo_uplift_pcts") if _m_res.get("placebo_uplift_pcts") is not None else []) if _is_valid_number(p)])
+                _mde_up = find_mde(_curve, "power_lift", _power_target)
+                _mde_dn = find_mde(_curve, "power_drop", _power_target)
+                _mde_rows.append({
+                    "Method": _m_name,
+                    "Placebo Windows": _n_windows,
+                    "MDE — uplift (80% power)": (f"+{_mde_up:.1f}%" if _mde_up is not None else "> +30%"),
+                    "MDE — decline (80% power)": (f"-{_mde_dn:.1f}%" if _mde_dn is not None else "< -30%"),
+                })
+            if not _mde_rows:
+                st.info(
+                    "Not enough placebo windows to estimate power (at least 5 per method are needed). "
+                    "Extend the pre-period history or shorten the placebo window length, then re-run validation."
+                )
+            else:
+                st.dataframe(pd.DataFrame(_mde_rows), width='stretch', hide_index=True)
+                _power_dir = st.radio(
+                    "Effect direction",
+                    ["Uplift (campaign / launch)", "Decline (media pause)"],
+                    horizontal=True,
+                    key=f"{mode_prefix}_power_direction",
+                )
+                _dir_col = "power_lift" if _power_dir.startswith("Uplift") else "power_drop"
+                _chart_frames = []
+                for _m_name, _curve in _power_curves.items():
+                    _chart_frames.append(pd.DataFrame({
+                        "Effect size (%)": _curve["effect_pct"],
+                        "Power (detection probability)": _curve[_dir_col],
+                        "Method": _m_name,
+                    }))
+                _power_chart_df = pd.concat(_chart_frames, ignore_index=True)
+                _fig_power = px.line(
+                    _power_chart_df,
+                    x="Effect size (%)",
+                    y="Power (detection probability)",
+                    color="Method",
+                    range_y=[0, 1.02],
+                )
+                _fig_power.add_hline(
+                    y=_power_target, line_dash="dash", line_color="grey",
+                    annotation_text=f"{int(_power_target * 100)}% power",
+                    annotation_position="top left",
+                )
+                st.plotly_chart(_fig_power, width='stretch')
+                st.download_button(
+                    "⬇️ Download power curve data (.xlsx)",
+                    data=build_chart_data_xlsx({"Power Curves": _power_chart_df}),
+                    file_name="power_analysis_mde.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"{mode_prefix}_download_power_data",
+                )
+                st.caption(
+                    "⚠️ Approximate by construction: the same finite set of placebo windows provides both the noise "
+                    "threshold and the power estimate; overlapping windows are not independent of each other; and the "
+                    "approach assumes future noise behaves like pre-period noise. Resolution is limited to roughly "
+                    "1 ÷ (number of placebo windows). Treat the MDE as a planning guide, not a guarantee."
+                )
+
 
 with tab2:
     st.subheader("🔍 Validate Test Design")
@@ -5396,6 +5614,22 @@ with tab4:
                         ),
                     )
 
+                    use_ar1_errors = st.checkbox(
+                        "Model residual autocorrelation (AR(1) errors) — recommended",
+                        value=True,
+                        key="use_ar1_errors",
+                        help=(
+                            "Controls how period-to-period noise in the counterfactual is modelled.\n\n"
+                            "ON (recommended): residuals follow an AR(1) process — e(t) = \u03c1\u00b7e(t\u22121) + shock — with \u03c1 "
+                            "estimated from the pre-period. When residuals are positively autocorrelated (Durbin-Watson "
+                            "below ~2 in the validation tabs), per-period errors reinforce rather than cancel across the "
+                            "test window, so the predictive interval on the TOTAL uplift widens to its honest width. The "
+                            "near-term forecast also carries over the last pre-period residual instead of resetting to the mean.\n\n"
+                            "OFF: period-to-period noise is treated as independent (the previous behaviour). When the "
+                            "estimated \u03c1 is near zero the two settings give near-identical results."
+                        ),
+                    )
+
                     _bayes_freq_blocked = st.session_state.get("frequency_mismatch_blocked", False)
                     if _bayes_freq_blocked:
                         st.info("Bayesian TBR is disabled until the frequency mismatch warning above (in the validation setup) is acknowledged or resolved.")
@@ -5497,6 +5731,7 @@ with tab4:
 
                                     # ---- Compute coefficient prior sigmas ----
                                     _use_structural = st.session_state.get("use_structural_priors", False)
+                                    _use_ar1 = st.session_state.get("use_ar1_errors", True)
                                     if _use_structural:
                                         # Data-driven sigma bounds from pre-period KPI correlations
                                         # corr[i] = how well control i tracks the test KPI historically
@@ -5597,9 +5832,36 @@ with tab4:
                                             sigma=prior_sigmas,
                                             shape=X_pre_scaled.shape[1],
                                         )
+                                        # When AR(1) errors are enabled, sigma is the *innovation* SD
+                                        # (per-period shock); the marginal residual SD is
+                                        # sigma / sqrt(1 - rho^2). When disabled, sigma is the plain
+                                        # i.i.d. residual SD, as before.
                                         sigma = pm.HalfNormal("sigma", sigma=1)
                                         mu = intercept + pm.math.dot(X_pre_scaled, coeffs)
-                                        pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_pre_scaled)
+                                        if _use_ar1:
+                                            # AR(1) residuals: e_t = rho * e_{t-1} + nu_t, nu_t ~ N(0, sigma).
+                                            # Exact likelihood via the conditional (Cochrane-Orcutt style)
+                                            # factorisation: the first observation uses the stationary
+                                            # marginal N(mu_0, sigma / sqrt(1 - rho^2)); every later
+                                            # observation is N(mu_t + rho * (y_{t-1} - mu_{t-1}), sigma).
+                                            # This makes the model - and every interval derived from it -
+                                            # aware of period-to-period autocorrelation instead of assuming
+                                            # independent noise (see Durbin-Watson in the validation tabs).
+                                            rho = pm.Uniform("rho", lower=-0.99, upper=0.99)
+                                            pm.Normal(
+                                                "y_obs_first",
+                                                mu=mu[0],
+                                                sigma=sigma / pm.math.sqrt(1.0 - rho ** 2),
+                                                observed=y_pre_scaled[0],
+                                            )
+                                            pm.Normal(
+                                                "y_obs",
+                                                mu=mu[1:] + rho * (y_pre_scaled[:-1] - mu[:-1]),
+                                                sigma=sigma,
+                                                observed=y_pre_scaled[1:],
+                                            )
+                                        else:
+                                            pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_pre_scaled)
                                         _mcmc_n_draws = 2000
                                         _mcmc_n_tune = 1000
                                         _mcmc_n_chains = 4
@@ -5619,6 +5881,12 @@ with tab4:
                                     post_int = trace.posterior["intercept"].values.flatten()
                                     post_coeff = trace.posterior["coeffs"].values.reshape(-1, X_pre_scaled.shape[1])
                                     post_sigma = trace.posterior["sigma"].values.flatten()
+                                    # rho posterior draws (zeros when AR(1) is off, so all downstream
+                                    # predictive code is a single path that degrades gracefully).
+                                    post_rho = (
+                                        trace.posterior["rho"].values.flatten()
+                                        if _use_ar1 else np.zeros_like(post_sigma)
+                                    )
 
                                     # ---- Enrich structural prior df with posterior coefficients ----
                                     posterior_coeff_means = post_coeff.mean(axis=0)
@@ -5648,8 +5916,21 @@ with tab4:
                                     # ---- Posterior predictive samples (with observation noise) ----
                                     # Used for the test/post 94% predictive interval band — the plausible
                                     # range of actual counterfactual *observations*, not just the mean.
-                                    noise_test = np.random.normal(0, post_sigma[:, None], size=mu_test_samples.shape)
-                                    y_pred_test_samples = mu_test_samples + noise_test
+                                    # Noise is simulated per posterior draw as an AR(1) residual path
+                                    # (rho = 0 exactly reproduces the previous i.i.d. behaviour), seeded
+                                    # for reproducibility, and anchored on the last pre-period residual so
+                                    # the near-term forecast carries over momentum instead of resetting.
+                                    # With positive autocorrelation, per-period errors reinforce rather
+                                    # than cancel when summed, so the interval on the TOTAL uplift widens
+                                    # — the honest width for the headline number.
+                                    _pred_rng = np.random.default_rng(42)
+                                    _e_last_pre = y_pre_scaled[-1] - mu_pre_samples[:, -1]
+                                    _gap_steps_test = ar1_gap_steps(pre_dates[-1], test_dates[0], bayes_freq_config)
+                                    resid_test = simulate_ar1_predictive_residuals(
+                                        post_rho, post_sigma, mu_test_samples.shape[1], _pred_rng,
+                                        e_start=_e_last_pre, n_gap_steps=_gap_steps_test,
+                                    )
+                                    y_pred_test_samples = mu_test_samples + resid_test
                                     y_pred_test_predictive_original = scaler_y.inverse_transform(y_pred_test_samples.T).T
                                     test_lower_pi = np.percentile(y_pred_test_predictive_original, 3, axis=0)
                                     test_upper_pi = np.percentile(y_pred_test_predictive_original, 97, axis=0)
@@ -5659,8 +5940,15 @@ with tab4:
                                         mu_post_original = scaler_y.inverse_transform(mu_post_samples.T).T
                                         y_pred_post_mean = mu_post_original.mean(axis=0)
 
-                                        noise_post = np.random.normal(0, post_sigma[:, None], size=mu_post_samples.shape)
-                                        y_pred_post_samples = mu_post_samples + noise_post
+                                        # Continue the same AR(1) residual paths through the
+                                        # (counterfactual) test window into the post period, bridging
+                                        # any calendar gap between the two.
+                                        _gap_steps_post = ar1_gap_steps(test_dates[-1], post_dates[0], bayes_freq_config)
+                                        resid_post = simulate_ar1_predictive_residuals(
+                                            post_rho, post_sigma, mu_post_samples.shape[1], _pred_rng,
+                                            e_start=resid_test[:, -1], n_gap_steps=_gap_steps_post,
+                                        )
+                                        y_pred_post_samples = mu_post_samples + resid_post
                                         y_pred_post_predictive_original = scaler_y.inverse_transform(y_pred_post_samples.T).T
                                         post_lower_pi = np.percentile(y_pred_post_predictive_original, 3, axis=0)
                                         post_upper_pi = np.percentile(y_pred_post_predictive_original, 97, axis=0)
@@ -5725,6 +6013,10 @@ with tab4:
                                         "n_draws": _mcmc_n_draws,
                                         "n_tune": _mcmc_n_tune,
                                         "target_accept": _mcmc_target_accept,
+                                        "use_ar1_errors": _use_ar1,
+                                        "rho_mean": float(np.mean(post_rho)) if _use_ar1 else None,
+                                        "rho_hdi_lower": float(np.percentile(post_rho, 3)) if _use_ar1 else None,
+                                        "rho_hdi_upper": float(np.percentile(post_rho, 97)) if _use_ar1 else None,
                                         "selected_metric": selected_metric,
                                         "test_start_ts": test_start_ts,
                                         "test_end_ts": test_end_ts,
@@ -5930,12 +6222,20 @@ with tab4:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="download_bayes_chart_data"
             )
+            _ar1_caption = ""
+            if bayes.get("use_ar1_errors") and bayes.get("rho_mean") is not None:
+                _ar1_caption = (
+                    f" Residual noise is modelled as an AR(1) process (estimated \u03c1 \u2248 {bayes['rho_mean']:.2f}, "
+                    f"94% interval {bayes['rho_hdi_lower']:.2f} to {bayes['rho_hdi_upper']:.2f}), so the green band and "
+                    "the uplift interval account for period-to-period autocorrelation instead of assuming independent noise."
+                )
             st.caption(
                 "**Blue** (pre-period) = uncertainty in the average fitted relationship, no noise added. "
                 "**Green** (test/post) = the plausible range of actual outcomes if there had been no test, "
                 f"including normal period-to-period ({bayes.get('frequency_config', {}).get('period_label_singular', 'week')}-to-{bayes.get('frequency_config', {}).get('period_label_singular', 'week')}) noise. "
                 "Compare actuals to the counterfactual line and green band "
                 "to judge the test period — the uplift cards above are the main readout for total impact."
+                + _ar1_caption
             )
 
             # ---- Posterior uplift distribution histogram ----
@@ -6000,7 +6300,8 @@ with tab4:
 
             # ---- MCMC Diagnostics ----
             import arviz as az
-            summary = az.summary(bayes['trace'], var_names=["intercept", "coeffs", "sigma"], hdi_prob=0.94)
+            _summary_vars = ["intercept", "coeffs", "sigma"] + (["rho"] if bayes.get("use_ar1_errors") else [])
+            summary = az.summary(bayes['trace'], var_names=_summary_vars, hdi_prob=0.94)
             _mcmc_n_chains = bayes.get("n_chains")
             _mcmc_n_draws = bayes.get("n_draws")
             _mcmc_n_tune = bayes.get("n_tune")
@@ -6170,6 +6471,7 @@ with tab4:
                 **Reading the chart**
                 - The blue band (pre-period) is the 94% HDI / credible interval around the *fitted counterfactual mean* — it does not include observation-level noise, so it is narrower.
                 - The green band (test/post-period) is the 94% posterior predictive interval — the plausible range of *actual counterfactual observations* under the no-test scenario, including observation-level noise. This is what you should compare the actuals against.
+                - When "Model residual autocorrelation (AR(1) errors)" is enabled (the default), the green band and the uplift interval are simulated from an AR(1) noise process with \u03c1 estimated from the pre-period — so multi-period totals do not assume period-to-period errors are independent, and the interval on the total uplift takes its honest (usually wider) width when residuals are autocorrelated.
                 """)
 
 # ------------------------------------------------------------
