@@ -2541,8 +2541,14 @@ def find_guided_test_group(agg_df, geo_col, total_market_pop,
                            target_share, tolerance_pp, search_iterations=2000):
     all_geos = set(agg_df[geo_col].unique())
     forced_test = set(force_exp_include)
+    # Exclusions are one-sided: force_ctrl_exclude removes a region from the
+    # CONTROL pool only — it remains a valid TEST candidate (and vice versa for
+    # force_exp_exclude, which is handled in the control-pool construction).
+    # To drop a region from the analysis entirely, it must be excluded from
+    # BOTH lists. Control-side INCLUDES are barred from test because a region
+    # can belong to only one group.
     forbidden_test = set(force_exp_exclude) | set(force_ctrl_include)
-    candidate = list(all_geos - forced_test - forbidden_test - set(force_ctrl_exclude))
+    candidate = list(all_geos - forced_test - forbidden_test)
     pop_map = agg_df.set_index(geo_col)[POPULATION_COL].to_dict()
     if any(g not in all_geos for g in forced_test):
         return [], 0, False
@@ -2987,6 +2993,11 @@ def render_structural_matching_tab():
                 "exp_exclude",
                 exclude_options,
                 label_visibility="collapsed",
+                help=(
+                    "Excluded from the TEST group only — these regions remain available "
+                    "for the control pool. To remove a region from the analysis entirely, "
+                    "also exclude it from the control list."
+                ),
                 key="exp_exclude_select"
             )
             force_exp_exclude = [label_to_geo[label] for label in selected_exclude_labels]
@@ -3082,6 +3093,10 @@ def render_structural_matching_tab():
                 "ctrl_include",
                 ctrl_options_with_pop,
                 label_visibility="collapsed",
+                help=(
+                    "A region can only be force-included in one group, so regions "
+                    "force-included in the test group are not shown here."
+                ),
                 key="ctrl_include_select"
             )
             force_ctrl_include = [label_to_ctrl[label] for label in selected_ctrl_include_labels]
@@ -3091,7 +3106,11 @@ def render_structural_matching_tab():
                 "ctrl_exclude",
                 exclude_ctrl_options,
                 label_visibility="collapsed",
-                help="These geographies cannot be used in control selection.",
+                help=(
+                    "Excluded from the CONTROL group only — these regions remain "
+                    "available for test selection. To remove a region from the analysis "
+                    "entirely, also exclude it from the test list."
+                ),
                 key="ctrl_exclude_select"
             )
             force_ctrl_exclude = [label_to_ctrl[label] for label in selected_ctrl_exclude_labels]
@@ -3300,6 +3319,10 @@ def render_structural_matching_tab():
                     st.warning(f"Target population share range was not met. Closest achieved: {achieved_share * 100:.1f}% (target {target_test_share}%, ±{target_tolerance_pp}pp).")
                 st.session_state.guided_share_info = {"achieved": achieved_share * 100, "target": target_test_share, "tolerance": target_tolerance_pp, "met": target_met}
                 all_geos = set(agg_df[geo_col].unique())
+                # Note: force_exp_exclude is deliberately NOT subtracted here — a region
+                # excluded from the test group remains available as a control. Exclusions
+                # are one-sided; only excluding a region from BOTH lists removes it from
+                # the analysis entirely.
                 control_pool_geos = list((all_geos - set(test_geos) - set(force_ctrl_exclude)) | set(force_ctrl_include))
             else:
                 st.session_state.guided_share_info = None
@@ -3368,7 +3391,12 @@ def render_structural_matching_tab():
                     if optimisation_score < best_score:
                         best_score, best_idx = optimisation_score, c_idx
                 elif match_mode == "Refined Greedy (Hill Climbing)":
-                    nn_w = NearestNeighbors(n_neighbors=min(len(pool_df), n + 5)).fit(p_scaled)
+                    # Fetch n + max_hill_climbing_swaps ranked neighbours so that, after the
+                    # first n seed the group, pot_swaps can actually contain up to
+                    # CONFIG["max_hill_climbing_swaps"] swap candidates. (Previously n + 5
+                    # left only ever 5 candidates, regardless of the config value, which
+                    # starved the search and made this strategy finish almost instantly.)
+                    nn_w = NearestNeighbors(n_neighbors=min(len(pool_df), n + CONFIG["max_hill_climbing_swaps"])).fit(p_scaled)
                     _, ind_w = nn_w.kneighbors(t_cent)
                     curr_idx = [pool_df.index[j] for j in ind_w[0][:n]]
                     pot_swaps = [pool_df.index[j] for j in ind_w[0] if pool_df.index[j] not in curr_idx][:CONFIG["max_hill_climbing_swaps"]]
@@ -3381,8 +3409,12 @@ def render_structural_matching_tab():
                         improved = False
                         best_improvement = 0
                         best_swap_tuple = None
-                        for j in range(min(len(curr_idx), 5)):
-                            for swap_in in pot_swaps[:10]:
+                        # Consider every selected position and every available swap
+                        # candidate. (Previously only the first 5 positions and first 10
+                        # candidates were tested, freezing most of the group at its
+                        # initial nearest-neighbour pick.)
+                        for j in range(len(curr_idx)):
+                            for swap_in in pot_swaps:
                                 temp = curr_idx.copy()
                                 temp[j] = swap_in
                                 new_metrics = fast_metrics(temp)
